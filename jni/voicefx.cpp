@@ -72,7 +72,15 @@ static inline short clamp16(float v) {
     return (short)v;
 }
 
+static int dsp_call_count = 0;
 static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
+    dsp_call_count++;
+    if (dsp_call_count == 1) logf("[VFX] dspCallback dipanggil pertama!");
+    if (dsp_call_count % 100 == 0) {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "[VFX] dsp calls: %d", dsp_call_count);
+        logf(tmp);
+    }
     if (!g_vfx.enabled || g_vfx.pitch_factor == 1.0f) return;
     short* s16 = (short*)buf;
     int n = (int)(len / 2);
