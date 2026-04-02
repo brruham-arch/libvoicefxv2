@@ -2,6 +2,9 @@
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
  * Syarat AML: __GetModInfo, OnModPreLoad, OnModLoad (extern "C")
  * ABI: armeabi-v7a ONLY
+ *
+ * Trick: export struct berisi semua function pointer
+ * Lua baca 1 simbol "vc_api" lalu dapat semua fungsi
  */
 
 #include <stdint.h>
@@ -14,8 +17,8 @@
 #define LOG_TAG  "libvoicefx"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
 #define LOGFILE "/storage/emulated/0/voicefx_log.txt"
+
 static void logf(const char* msg) {
     FILE* f = fopen(LOGFILE, "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
@@ -24,9 +27,9 @@ static void logf(const char* msg) {
 // ============================================================
 // TYPES
 // ============================================================
-typedef unsigned int  DWORD;
-typedef unsigned int  HRECORD;
-typedef unsigned int  HDSP;
+typedef unsigned int DWORD;
+typedef unsigned int HRECORD;
+typedef unsigned int HDSP;
 typedef void (*DSPPROC)(HDSP, DWORD, void*, DWORD, void*);
 
 // ============================================================
@@ -47,15 +50,15 @@ struct VoiceFX {
     float  overlap[OVERLAP_SIZE];
 };
 
-static VoiceFX g_vfx = {};
+static VoiceFX g_vfx     = {};
 static HRECORD g_recHandle = 0;
 static HDSP    g_dspHandle = 0;
 
-static HDSP    (*pBASSChannelSetDSP)(HRECORD, DSPPROC, void*, int) = nullptr;
-static int     (*pBASSChannelRemoveDSP)(HRECORD, HDSP)             = nullptr;
-static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*) = nullptr;
-static void*   (*pDobbySymbolResolver)(const char*, const char*)   = nullptr;
-static int     (*pDobbyHook)(void*, void*, void**)                 = nullptr;
+static HDSP    (*pBASSChannelSetDSP)(HRECORD, DSPPROC, void*, int)     = nullptr;
+static int     (*pBASSChannelRemoveDSP)(HRECORD, HDSP)                 = nullptr;
+static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*)  = nullptr;
+static void*   (*pDobbySymbolResolver)(const char*, const char*)        = nullptr;
+static int     (*pDobbyHook)(void*, void*, void**)                      = nullptr;
 
 static inline float hann_w(int i, int n) {
     return 0.5f * (1.0f - cosf(6.28318f * i / (n - 1)));
@@ -126,25 +129,45 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
 }
 
 // ============================================================
-// PUBLIC API (dipanggil Lua via dlsym)
+// INTERNAL FUNCTIONS
 // ============================================================
-extern "C" {
-
-void vc_set_pitch(float f) {
+static void  _vc_set_pitch(float f) {
     if (f < 0.25f) f = 0.25f;
     if (f > 4.0f)  f = 4.0f;
     g_vfx.pitch_factor = f;
 }
-void  vc_enable(void)     { g_vfx.enabled = 1; }
-void  vc_disable(void)    { g_vfx.enabled = 0; }
-int   vc_is_enabled(void) { return g_vfx.enabled; }
-float vc_get_pitch(void)  { return g_vfx.pitch_factor; }
+static void  _vc_enable(void)     { g_vfx.enabled = 1; }
+static void  _vc_disable(void)    { g_vfx.enabled = 0; }
+static int   _vc_is_enabled(void) { return g_vfx.enabled; }
+static float _vc_get_pitch(void)  { return g_vfx.pitch_factor; }
+
+// ============================================================
+// EXPORTED API STRUCT
+// Lua baca pointer struct ini, lalu panggil tiap fungsi
+// ============================================================
+struct VcAPI {
+    void  (*set_pitch)(float);
+    void  (*enable)(void);
+    void  (*disable)(void);
+    int   (*is_enabled)(void);
+    float (*get_pitch)(void);
+};
+
+extern "C" {
+
+// Struct ini yang dibaca Lua — 1 simbol, semua fungsi
+VcAPI vc_api = {
+    _vc_set_pitch,
+    _vc_enable,
+    _vc_disable,
+    _vc_is_enabled,
+    _vc_get_pitch,
+};
 
 // ============================================================
 // AML REQUIRED FUNCTIONS
 // ============================================================
 void* __GetModInfo() {
-    // Return pointer ke string info mod (format bebas)
     static const char* info = "libvoicefx|1.0|VoiceFX for SAMP|brruham";
     return (void*)info;
 }
@@ -159,51 +182,46 @@ void OnModLoad() {
     logf("[VFX] OnModLoad dipanggil");
     LOGI("OnModLoad");
 
-    // Load Dobby
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hDobby) {
-        logf("[VFX] ERROR: libdobby.so gagal");
-        LOGE("libdobby: %s", dlerror());
-        return;
-    }
+    if (!hDobby) { logf("[VFX] ERROR: libdobby.so gagal"); return; }
     logf("[VFX] libdobby OK");
 
     pDobbySymbolResolver = (void*(*)(const char*,const char*))dlsym(hDobby, "DobbySymbolResolver");
     pDobbyHook           = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
     if (!pDobbySymbolResolver || !pDobbyHook) {
-        logf("[VFX] ERROR: Dobby symbols tidak ditemukan");
-        return;
+        logf("[VFX] ERROR: Dobby symbols tidak ditemukan"); return;
     }
     logf("[VFX] Dobby symbols OK");
 
-    // Load BASS
     void* hBASS = dlopen("libBASS.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hBASS) {
-        logf("[VFX] ERROR: libBASS.so gagal");
-        return;
-    }
+    if (!hBASS) { logf("[VFX] ERROR: libBASS.so gagal"); return; }
     logf("[VFX] libBASS OK");
 
     pBASSChannelSetDSP    = (HDSP(*)(HRECORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
     pBASSChannelRemoveDSP = (int(*)(HRECORD,HDSP))dlsym(hBASS, "BASS_ChannelRemoveDSP");
 
     void* addr = pDobbySymbolResolver("libBASS.so", "BASS_RecordStart");
-    if (!addr) {
-        logf("[VFX] ERROR: BASS_RecordStart tidak ditemukan");
-        return;
-    }
+    if (!addr) { logf("[VFX] ERROR: BASS_RecordStart tidak ditemukan"); return; }
 
     int r = pDobbyHook(addr, (void*)hook_BASSRecordStart, (void**)&orig_BASSRecordStart);
-    if (r != 0) {
-        logf("[VFX] ERROR: DobbyHook gagal");
-        return;
-    }
+    if (r != 0) { logf("[VFX] ERROR: DobbyHook gagal"); return; }
 
     memset(&g_vfx, 0, sizeof(g_vfx));
     g_vfx.pitch_factor = 1.0f;
 
     logf("[VFX] OnModLoad SELESAI - siap!");
+
+    // Tulis alamat vc_api ke file untuk Lua
+    FILE* af = fopen("/storage/emulated/0/voicefx_addr.txt", "w");
+    if (af) {
+        fprintf(af, "%lu\n", (unsigned long)&vc_api);
+        fclose(af);
+        logf("[VFX] vc_api addr ditulis ke voicefx_addr.txt");
+    }
     LOGI("OnModLoad done");
 }
 
 } // extern "C"
+
+// TAMBAHAN: tulis alamat vc_api ke file agar Lua bisa baca
+// Dipanggil di akhir OnModLoad

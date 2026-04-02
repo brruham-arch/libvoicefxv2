@@ -1,46 +1,59 @@
--- voicechanger.lua v4.0
--- AML mod: libvoicefx.so handle semua hook+DSP
--- Lua hanya controller via dlsym(RTLD_DEFAULT)
+-- voicechanger.lua v4.2
+-- Baca alamat vc_api dari file yang ditulis OnModLoad
+-- Lalu cast ke struct dan panggil langsung
 
 local ffi = require("ffi")
 
 ffi.cdef[[
-    void* dlsym(void* handle, const char* symbol);
+    typedef struct {
+        void  (*set_pitch)(float);
+        void  (*enable)(void);
+        void  (*disable)(void);
+        int   (*is_enabled)(void);
+        float (*get_pitch)(void);
+    } VcAPI;
 ]]
 
-local dl = ffi.load("libdl.so")
 local vc = nil
 
 local function loadEngine()
-    -- AML sudah load .so ke proses, cari via RTLD_DEFAULT (NULL)
-    local ptr = dl.dlsym(nil, "vc_set_pitch")
-    if ptr == nil then
-        sampAddChatMessage("[VFX] ERROR: libvoicefx.so belum di-load AML", 0xFF4444)
-        sampAddChatMessage("[VFX] Pastikan ada di: files/AML/mods/libvoicefx.so", 0xFFFF00)
+    -- Baca alamat vc_api yang ditulis OnModLoad ke file
+    local f = io.open("/storage/emulated/0/voicefx_addr.txt", "r")
+    if not f then
+        sampAddChatMessage("[VFX] voicefx_addr.txt tidak ditemukan!", 0xFF4444)
+        sampAddChatMessage("[VFX] Pastikan libvoicefx.so ada di AML/mods/", 0xFFFF00)
         return nil
     end
 
-    local function sym(name, sig)
-        local p = dl.dlsym(nil, name)
-        if p == nil then return nil end
-        return ffi.cast(sig, p)
+    local addrStr = f:read("*l")
+    f:close()
+
+    local addr = tonumber(addrStr)
+    if not addr or addr == 0 then
+        sampAddChatMessage("[VFX] Alamat tidak valid: " .. tostring(addrStr), 0xFF4444)
+        return nil
     end
 
-    sampAddChatMessage("[VFX] Engine ditemukan via AML!", 0x00FF88)
-    return {
-        set_pitch  = sym("vc_set_pitch",  "void(*)(float)"),
-        enable     = sym("vc_enable",     "void(*)(void)"),
-        disable    = sym("vc_disable",    "void(*)(void)"),
-        is_enabled = sym("vc_is_enabled", "int(*)(void)"),
-        get_pitch  = sym("vc_get_pitch",  "float(*)(void)"),
-    }
+    sampAddChatMessage("[VFX] vc_api addr: 0x" .. string.format("%x", addr), 0x00FFFF)
+
+    -- Cast alamat ke pointer struct VcAPI
+    local api = ffi.cast("VcAPI*", addr)
+
+    -- Verifikasi fungsi tidak null
+    if api.set_pitch == nil then
+        sampAddChatMessage("[VFX] set_pitch null!", 0xFF4444)
+        return nil
+    end
+
+    sampAddChatMessage("[VFX] Engine loaded!", 0x00FF88)
+    return api
 end
 
 function main()
     while not isSampAvailable() do wait(100) end
     wait(1000)
 
-    sampAddChatMessage("[VoiceFX] v4.0 loading...", 0xFFFF00)
+    sampAddChatMessage("[VoiceFX] v4.2 loading...", 0xFFFF00)
 
     vc = loadEngine()
     if vc == nil then return end
