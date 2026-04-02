@@ -37,7 +37,7 @@ typedef void (*DSPPROC)(HDSP, DWORD, void*, DWORD, void*);
 #define RING_SIZE  (1 << RING_BITS)   // 16384 samples
 #define RING_MASK  (RING_SIZE - 1)
 
-#define FRAME_SIZE 1024                // ukuran frame OLA
+#define FRAME_SIZE 256                // ukuran frame OLA
 #define HOP_SIZE   128                // hop antar frame (50% overlap)
 
 static float  g_pitch   = 1.0f;
