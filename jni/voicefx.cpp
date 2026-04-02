@@ -1,6 +1,12 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
- * v2.2 - Fix echo & choppy: crossfade menggunakan ekor frame sebelumnya
+ * v3.0 - Ring buffer resampler: tidak ada wrap per-frame, tidak ada echo
+ *
+ * Cara kerja:
+ *   - Semua input sample ditulis ke ring buffer secara kontinu (wPos++)
+ *   - Output dibaca dari ring buffer dengan kecepatan g_pitch (rPos += pitch)
+ *   - Tidak ada batas/wrap per frame → transisi antar frame mulus
+ *   - Tidak ada dua sumber dicampur di waktu bersamaan → tidak ada echo
  */
 
 #include <stdint.h>
@@ -27,14 +33,19 @@ typedef void (*DSPPROC)(HDSP, DWORD, void*, DWORD, void*);
 static float g_pitch   = 1.0f;
 static int   g_enabled = 0;
 
-#define MAX_BUF  8192
-#define XFADE    64      // crossfade zone samples
+// ============================================================
+// RING BUFFER
+// Ukuran = 16x MAX_BUF (power-of-2 agar modulo bisa pakai AND)
+// ============================================================
+#define MAX_BUF    8192
+#define RING_SIZE  (MAX_BUF * 16)   // 131072 samples
+#define RING_MASK  (RING_SIZE - 1)  // untuk modulo cepat
 
-static short g_buf[MAX_BUF];
+static short g_ring[RING_SIZE];
 
-// --- FIX v2.2: simpan frame sebelumnya untuk crossfade ---
-static short g_prev[MAX_BUF];
-static int   g_prev_n = 0;
+static int64_t g_wPos       = 0;
+static double  g_rPos       = 0.0;
+static int     g_ring_ready = 0;
 
 static inline short clamp16(float v) {
     if (v >  32767.f) return  32767;
@@ -52,42 +63,48 @@ static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
     int n = (int)(len / 2);
     if (n <= 0 || n > MAX_BUF) return;
 
-    // Salin input ke working buffer
-    memcpy(g_buf, s16, n * sizeof(short));
-
-    float factor = g_pitch;
-
+    // -----------------------------------------------------------
+    // LANGKAH 1: Tulis n sample input ke ring buffer
+    // -----------------------------------------------------------
     for (int i = 0; i < n; i++) {
-        float srcF = (float)i * factor;
+        g_ring[(g_wPos + i) & RING_MASK] = s16[i];
+    }
+    g_wPos += n;
 
-        // Posisi dalam buffer dengan wrap
-        float pos  = fmodf(srcF, (float)n);
-        int   wrap = (int)(srcF / (float)n);
-
-        // Interpolasi linear di posisi baca
-        int   p0   = (int)pos;
-        int   p1   = (p0 + 1 < n) ? p0 + 1 : p0;
-        float frac = pos - p0;
-        float val  = g_buf[p0] * (1.f - frac) + g_buf[p1] * frac;
-
-        // Crossfade di titik wrap:
-        // Gunakan EKOR frame SEBELUMNYA (g_prev), bukan bagian lain
-        // dari frame sekarang. Ini menghilangkan echo dan patah-patah.
-        if (wrap > 0 && pos < (float)XFADE && g_prev_n == n) {
-            float alpha   = pos / (float)XFADE;           // 0.0 → 1.0
-            int   pp      = n - XFADE + (int)pos;
-            if (pp >= n) pp = n - 1;
-            float prev_val = (float)g_prev[pp];
-            // Fade dari ekor frame lama ke awal frame baru
-            val = prev_val * (1.f - alpha) + val * alpha;
-        }
-
-        s16[i] = clamp16(val);
+    // Inisialisasi rPos satu frame di belakang wPos
+    if (!g_ring_ready) {
+        g_rPos       = (double)(g_wPos - n);
+        g_ring_ready = 1;
     }
 
-    // Simpan frame ini untuk dipakai di pemanggilan berikutnya
-    memcpy(g_prev, g_buf, n * sizeof(short));
-    g_prev_n = n;
+    // -----------------------------------------------------------
+    // LANGKAH 2: Baca n sample output dengan kecepatan pitch
+    // -----------------------------------------------------------
+    double pitch = (double)g_pitch;
+
+    for (int i = 0; i < n; i++) {
+
+        // Guard underrun: rPos mengejar wPos (pitch terlalu tinggi)
+        if (g_rPos + 1.0 >= (double)g_wPos) {
+            s16[i] = g_ring[(g_wPos - 1) & RING_MASK];
+            g_rPos  = (double)(g_wPos - 1);
+            continue;
+        }
+
+        // Guard overflow: rPos terlalu jauh di belakang
+        if ((double)g_wPos - g_rPos > (double)(RING_SIZE - n)) {
+            g_rPos = (double)(g_wPos - n);
+        }
+
+        // Interpolasi linear
+        int64_t p0   = (int64_t)g_rPos;
+        float   frac = (float)(g_rPos - (double)p0);
+        float   val  = g_ring[ p0      & RING_MASK] * (1.f - frac)
+                     + g_ring[(p0 + 1) & RING_MASK] * frac;
+
+        s16[i]  = clamp16(val);
+        g_rPos += pitch;
+    }
 }
 
 // ============================================================
@@ -114,12 +131,19 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
 // ============================================================
 // PUBLIC API
 // ============================================================
-static void  _vc_set_pitch(float f) {
+static void _vc_set_pitch(float f) {
     if (f < 0.25f) f = 0.25f;
     if (f > 4.0f)  f = 4.0f;
     g_pitch = f;
 }
-static void  _vc_enable(void)     { g_enabled = 1; }
+static void  _vc_enable(void) {
+    // Reset ring setiap enable agar tidak ada sisa data lama
+    memset(g_ring, 0, sizeof(g_ring));
+    g_wPos       = 0;
+    g_rPos       = 0.0;
+    g_ring_ready = 0;
+    g_enabled    = 1;
+}
 static void  _vc_disable(void)    { g_enabled = 0; }
 static int   _vc_is_enabled(void) { return g_enabled; }
 static float _vc_get_pitch(void)  { return g_pitch; }
@@ -143,20 +167,21 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|2.2|VoiceFX prev-frame crossfade|brruham";
+    static const char* info = "libvoicefx|3.0|VoiceFX ring-buffer|brruham";
     return (void*)info;
 }
 
 void OnModPreLoad() {
     remove(LOGFILE);
-    logf("[VFX] OnModPreLoad v2.2");
-    // Reset state frame buffer
-    memset(g_prev, 0, sizeof(g_prev));
-    g_prev_n = 0;
+    logf("[VFX] OnModPreLoad v3.0");
+    memset(g_ring, 0, sizeof(g_ring));
+    g_wPos       = 0;
+    g_rPos       = 0.0;
+    g_ring_ready = 0;
 }
 
 void OnModLoad() {
-    logf("[VFX] OnModLoad v2.2");
+    logf("[VFX] OnModLoad v3.0");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf("[VFX] ERROR: libdobby"); return; }
@@ -184,7 +209,7 @@ void OnModLoad() {
     FILE* af = fopen("/storage/emulated/0/voicefx_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&vc_api); fclose(af); }
 
-    logf("[VFX] OnModLoad SELESAI v2.2!");
+    logf("[VFX] OnModLoad SELESAI v3.0!");
 }
 
 } // extern "C"
