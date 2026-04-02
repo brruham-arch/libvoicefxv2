@@ -1,6 +1,6 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
- * Algoritma: simple in-place resample + crossfade di batas wrap
+ * v2.2 - Fix echo & choppy: crossfade menggunakan ekor frame sebelumnya
  */
 
 #include <stdint.h>
@@ -32,6 +32,10 @@ static int   g_enabled = 0;
 
 static short g_buf[MAX_BUF];
 
+// --- FIX v2.2: simpan frame sebelumnya untuk crossfade ---
+static short g_prev[MAX_BUF];
+static int   g_prev_n = 0;
+
 static inline short clamp16(float v) {
     if (v >  32767.f) return  32767;
     if (v < -32768.f) return -32768;
@@ -48,45 +52,42 @@ static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
     int n = (int)(len / 2);
     if (n <= 0 || n > MAX_BUF) return;
 
-    // Copy input
+    // Salin input ke working buffer
     memcpy(g_buf, s16, n * sizeof(short));
 
     float factor = g_pitch;
 
     for (int i = 0; i < n; i++) {
-        float srcF = i * factor;
+        float srcF = (float)i * factor;
 
         // Posisi dalam buffer dengan wrap
-        int   wrap = (int)srcF / n;   // berapa kali sudah wrap
-        float pos  = srcF - wrap * n; // posisi dalam buf [0, n)
+        float pos  = fmodf(srcF, (float)n);
+        int   wrap = (int)(srcF / (float)n);
 
+        // Interpolasi linear di posisi baca
         int   p0   = (int)pos;
         int   p1   = (p0 + 1 < n) ? p0 + 1 : p0;
         float frac = pos - p0;
+        float val  = g_buf[p0] * (1.f - frac) + g_buf[p1] * frac;
 
-        float val = g_buf[p0] * (1.f - frac) + g_buf[p1] * frac;
-
-        // Crossfade di zona wrap (XFADE sample sebelum/sesudah titik wrap)
-        float wrap_pos = fmodf(srcF, (float)n);
-        if (wrap_pos < XFADE) {
-            // Awal setelah wrap — fade in dari sample sebelumnya
-            float alpha = wrap_pos / XFADE;
-            // Sample dari posisi n - XFADE + wrap_pos (akhir buffer)
-            int prev_p = (int)(n - XFADE + wrap_pos);
-            if (prev_p >= n) prev_p = n - 1;
-            float prev_val = g_buf[prev_p];
+        // Crossfade di titik wrap:
+        // Gunakan EKOR frame SEBELUMNYA (g_prev), bukan bagian lain
+        // dari frame sekarang. Ini menghilangkan echo dan patah-patah.
+        if (wrap > 0 && pos < (float)XFADE && g_prev_n == n) {
+            float alpha   = pos / (float)XFADE;           // 0.0 → 1.0
+            int   pp      = n - XFADE + (int)pos;
+            if (pp >= n) pp = n - 1;
+            float prev_val = (float)g_prev[pp];
+            // Fade dari ekor frame lama ke awal frame baru
             val = prev_val * (1.f - alpha) + val * alpha;
-        } else if (wrap_pos > n - XFADE) {
-            // Akhir sebelum wrap — fade out ke sample awal buffer
-            float alpha = (n - wrap_pos) / XFADE;
-            int next_p = (int)(wrap_pos - (n - XFADE));
-            if (next_p >= n) next_p = n - 1;
-            float next_val = g_buf[next_p];
-            val = val * alpha + next_val * (1.f - alpha);
         }
 
         s16[i] = clamp16(val);
     }
+
+    // Simpan frame ini untuk dipakai di pemanggilan berikutnya
+    memcpy(g_prev, g_buf, n * sizeof(short));
+    g_prev_n = n;
 }
 
 // ============================================================
@@ -142,17 +143,20 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|2.1|VoiceFX crossfade|brruham";
+    static const char* info = "libvoicefx|2.2|VoiceFX prev-frame crossfade|brruham";
     return (void*)info;
 }
 
 void OnModPreLoad() {
     remove(LOGFILE);
-    logf("[VFX] OnModPreLoad");
+    logf("[VFX] OnModPreLoad v2.2");
+    // Reset state frame buffer
+    memset(g_prev, 0, sizeof(g_prev));
+    g_prev_n = 0;
 }
 
 void OnModLoad() {
-    logf("[VFX] OnModLoad");
+    logf("[VFX] OnModLoad v2.2");
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf("[VFX] ERROR: libdobby"); return; }
@@ -180,7 +184,7 @@ void OnModLoad() {
     FILE* af = fopen("/storage/emulated/0/voicefx_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&vc_api); fclose(af); }
 
-    logf("[VFX] OnModLoad SELESAI!");
+    logf("[VFX] OnModLoad SELESAI v2.2!");
 }
 
 } // extern "C"
