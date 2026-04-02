@@ -1,5 +1,5 @@
 /**
- * voicefx.cpp - AML Voice FX Mod v3.2 NO ECHO EDITION
+ * voicefx.cpp - v3.3 ANTI-DUPLICATE (FINAL NO ECHO!)
  */
 #include <stdint.h>
 #include <string.h>
@@ -24,16 +24,20 @@ typedef void (*DSPPROC)(HDSP, DWORD, void*, DWORD, void*);
 static float g_pitch = 1.0f;
 static int   g_enabled = 0;
 
-// RING BUFFER DUAL POSITION (NO ECHO!)
+// DUAL POS + ANTI-DUPLICATE
 #define MAX_BUF        8192
 #define RING_SIZE      (MAX_BUF * 16)
 #define RING_MASK      (RING_SIZE - 1)
-#define LATENCY_SAMPLES (MAX_BUF * 2)  // 16384 samples
+#define LATENCY_SAMPLES (MAX_BUF * 2)
 
 static short g_ring[RING_SIZE];
-static int64_t g_wPos = 0;           // WRITE pos (input)
-static double  g_playPos = 0.0;      // PLAYBACK pos (output TERPISAH!)
+static int64_t g_wPos = 0;
+static double  g_playPos = 0.0;
 static int     g_latency_filled = 0;
+
+// ANTI-DUPLICATE
+static int64_t  g_last_wPos = 0;
+static int      g_frame_processed = 0;
 
 static inline short clamp16(float v) {
     if (v >  32767.f) return  32767;
@@ -41,70 +45,73 @@ static inline short clamp16(float v) {
     return (short)v;
 }
 
-// FIXED DSP - NO ECHO!
-static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
+// FINAL DSP - NO DUPLICATES!
+static void dspCallback(HDSP dsp, DWORD channel, void* buf, DWORD length, void* user) {
+    static uint64_t frame_counter = 0;
+    frame_counter++;
+
+    // 🔥 CRITICAL: BLOCK DUPLICATE CALLS
+    if (g_last_wPos == g_wPos && g_frame_processed) {
+        return;  // SILENT BLOCK!
+    }
+
     if (!g_enabled || fabs(g_pitch - 1.0f) < 0.01f) return;
 
     short* s16 = (short*)buf;
-    int n = (int)(len / 2);
+    int n = (int)(length / 2);
     if (n <= 0 || n > MAX_BUF) return;
 
-    // 1. WRITE INPUT
+    g_frame_processed = 1;
+    g_last_wPos = g_wPos;
+
+    // WRITE
     for (int i = 0; i < n; i++) {
         g_ring[(g_wPos + i) & RING_MASK] = s16[i];
     }
-    g_wPos += n;
+    int64_t new_wPos = g_wPos + n;
 
-    // 2. SETUP PLAYBACK (TERPISAH)
+    // LATENCY
     if (!g_latency_filled) {
-        g_playPos = (double)(g_wPos - LATENCY_SAMPLES);
+        g_playPos = (double)(new_wPos - LATENCY_SAMPLES);
         g_latency_filled = 1;
+        g_wPos = new_wPos;
         return;
     }
 
+    // RESAMPLE
     double pitch = g_pitch;
-    double buffer_fill = (double)g_wPos - g_playPos;
-
-    // 3. READ OUTPUT dari g_playPos
     for (int i = 0; i < n; i++) {
-        if (g_playPos >= (double)g_wPos) {
-            int64_t safe_pos = g_wPos - LATENCY_SAMPLES;
-            if (safe_pos < 0) safe_pos = 0;
-            s16[i] = g_ring[safe_pos & RING_MASK];
-            g_playPos = (double)safe_pos;
+        if (g_playPos >= (double)new_wPos) {
+            int64_t safe = new_wPos - LATENCY_SAMPLES;
+            s16[i] = g_ring[safe & RING_MASK];
+            g_playPos = (double)safe;
             continue;
         }
 
-        if (buffer_fill > (double)(RING_SIZE * 0.9)) {
-            g_playPos = (double)(g_wPos - LATENCY_SAMPLES);
-            float fade = 0.2f + 0.8f * (float)i / (float)n;
+        if ((double)new_wPos - g_playPos > (double)(RING_SIZE * 0.9)) {
+            g_playPos = (double)(new_wPos - LATENCY_SAMPLES);
+            float fade = 0.3f + 0.7f * (float)i / n;
             int64_t p0 = (int64_t)g_playPos;
-            float val = (float)g_ring[p0 & RING_MASK] * fade;
-            s16[i] = clamp16(val);
+            s16[i] = clamp16((float)g_ring[p0 & RING_MASK] * fade);
             g_playPos += pitch;
             continue;
         }
 
         int64_t p0 = (int64_t)g_playPos;
-        double frac_d = g_playPos - (double)p0;
-        float frac = (float)frac_d;
-        
+        float frac = (float)(g_playPos - (double)p0);
         int64_t p1 = p0 + 1;
-        if (p1 >= g_wPos) {
-            p1 = g_wPos - 1;
-            frac = 0.0f;
-        }
+        if (p1 >= new_wPos) p1 = new_wPos - 1;
         
-        float s0 = (float)g_ring[p0 & RING_MASK];
-        float s1 = (float)g_ring[p1 & RING_MASK];
-        float val = s0 * (1.f - frac) + s1 * frac;
-
-        s16[i] = clamp16(val);
+        float s0 = g_ring[p0 & RING_MASK];
+        float s1 = g_ring[p1 & RING_MASK];
+        s16[i] = clamp16(s0 * (1.f - frac) + s1 * frac);
         g_playPos += pitch;
     }
+    
+    g_wPos = new_wPos;
 }
 
-// HOOKS (sama seperti sebelumnya)
+// HOOKS & API (sama persis seperti v3.2)
 static HDSP    (*pBASSChannelSetDSP)(HRECORD, DSPPROC, void*, int)    = nullptr;
 static int     (*pBASSChannelRemoveDSP)(HRECORD, HDSP)                = nullptr;
 static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*) = nullptr;
@@ -122,14 +129,9 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
         if (g_dspHandle) pBASSChannelRemoveDSP(handle, g_dspHandle);
         g_dspHandle = pBASSChannelSetDSP(handle, dspCallback, nullptr, 1);
     }
-    
-    char msg[128];
-    sprintf(msg, "[VFX] RecordStart: handle=%u DSP=%u", (unsigned)handle, (unsigned)g_dspHandle);
-    logf(msg);
     return handle;
 }
 
-// API
 static void _vc_set_pitch(float f) {
     if (f < 0.25f) f = 0.25f;
     if (f > 4.0f)  f = 4.0f;
@@ -139,12 +141,13 @@ static void _vc_set_pitch(float f) {
 static void _vc_enable(void) {
     g_enabled = 1;
     g_latency_filled = 0;
-    logf("[VFX v3.2] ENABLED - NO ECHO!");
+    g_frame_processed = 0;
+    logf("[VFX v3.3] ENABLED - ANTI-DUPLICATE!");
 }
 
 static void _vc_disable(void) {
     g_enabled = 0;
-    g_latency_filled = 0;
+    g_frame_processed = 0;
     logf("[VFX] DISABLED");
 }
 
@@ -163,40 +166,36 @@ extern "C" {
 VcAPI vc_api = { _vc_set_pitch, _vc_enable, _vc_disable, _vc_is_enabled, _vc_get_pitch };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|3.2|NO ECHO DUAL POS|brruham";
-    return (void*)info;
+    return (void*)"libvoicefx|3.3|ANTI-DUPLICATE|brruham";
 }
 
 void OnModPreLoad() {
     remove(LOGFILE);
-    logf("[VFX v3.2] PreLoad - NO ECHO EDITION");
+    logf("[VFX v3.3] ANTI-DUPLICATE EDITION");
     memset(g_ring, 0, sizeof(g_ring));
     g_wPos = 0; g_playPos = 0.0; g_latency_filled = 0;
+    g_last_wPos = 0; g_frame_processed = 0;
     g_pitch = 1.0f; g_enabled = 0;
 }
 
 void OnModLoad() {
-    logf("[VFX v3.2] Loading NO ECHO hooks...");
+    logf("[VFX v3.3] Loading ANTI-DUPLICATE...");
     
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hDobby) return logf("[VFX] FATAL: no dobby");
+    if (!hDobby) return;
 
     pDobbySymbolResolver = (void*(*)(const char*,const char*))dlsym(hDobby, "DobbySymbolResolver");
     pDobbyHook = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
     
     void* hBASS = dlopen("libBASS.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hBASS) return logf("[VFX] FATAL: no BASS");
-
     pBASSChannelSetDSP = (HDSP(*)(HRECORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
     pBASSChannelRemoveDSP = (int(*)(HRECORD,HDSP))dlsym(hBASS, "BASS_ChannelRemoveDSP");
 
     void* target = pDobbySymbolResolver("libBASS.so", "BASS_RecordStart");
     if (target && pDobbyHook(target, (void*)hook_BASSRecordStart, (void**)&orig_BASSRecordStart) == 0) {
-        
         FILE* af = fopen("/storage/emulated/0/voicefx_addr.txt", "w");
         if (af) { fprintf(af, "%lu\n", (unsigned long)&vc_api); fclose(af); }
-        
-        logf("[VFX v3.2] NO ECHO LOADED! 🎉");
+        logf("[VFX v3.3] ANTI-DUPLICATE LOADED! ✅");
     }
 }
 }
