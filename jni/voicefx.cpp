@@ -81,7 +81,7 @@ static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
         snprintf(tmp, sizeof(tmp), "[VFX] dsp calls: %d", dsp_call_count);
         logf(tmp);
     }
-    if (!g_vfx.enabled || g_vfx.pitch_factor == 1.0f) return;
+    char dbg[64]; snprintf(dbg, sizeof(dbg), "[VFX] dsp en=%d pf=%.2f", g_vfx.enabled, g_vfx.pitch_factor); if(dsp_call_count <= 3) logf(dbg); if (!g_vfx.enabled || g_vfx.pitch_factor == 1.0f) return;
     short* s16 = (short*)buf;
     int n = (int)(len / 2);
     if (n <= 0 || n > MAX_SAMPLES) return;
@@ -144,8 +144,8 @@ static void  _vc_set_pitch(float f) {
     if (f > 4.0f)  f = 4.0f;
     g_vfx.pitch_factor = f;
 }
-static void  _vc_enable(void)     { g_vfx.enabled = 1; }
-static void  _vc_disable(void)    { g_vfx.enabled = 0; }
+static void  _vc_enable(void)     { g_vfx.enabled = 1; logf("[VFX] enable dipanggil!"); }
+static void  _vc_disable(void)    { g_vfx.enabled = 0; logf("[VFX] disable dipanggil!"); }
 static int   _vc_is_enabled(void) { return g_vfx.enabled; }
 static float _vc_get_pitch(void)  { return g_vfx.pitch_factor; }
 
