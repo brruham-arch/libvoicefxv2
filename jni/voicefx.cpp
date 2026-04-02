@@ -1,7 +1,7 @@
 /**
 
-* voicefx.cpp - AML Voice FX Mod (HYBRID WSOLA + RESAMPLE)
-* Pitch berubah + lebih smooth dari OLA
+* voicefx.cpp - AML Voice FX Mod (HYBRID FIX BUILD)
+* Sudah fix error NDK + hybrid pitch changer
   */
 
 #include <stdint.h>
@@ -13,7 +13,6 @@
 #include <stdlib.h>
 
 #define LOG_TAG "libvoicefx"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, VA_ARGS)
 #define LOGFILE "/storage/emulated/0/voicefx_log.txt"
 
 static void logf(const char* msg) {
@@ -24,7 +23,8 @@ if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 typedef unsigned int DWORD;
 typedef unsigned int HRECORD;
 typedef unsigned int HDSP;
-typedef void (DSPPROC)(HDSP, DWORD, void, DWORD, void*);
+
+
 
 // ============================================================
 // CONFIG
@@ -34,18 +34,12 @@ typedef void (DSPPROC)(HDSP, DWORD, void, DWORD, void*);
 #define RING_SIZE  (1 << RING_BITS)
 #define RING_MASK  (RING_SIZE - 1)
 
-#define FRAME_SIZE 256
-#define HOP_SIZE   128
-
 static float g_pitch   = 1.0f;
 static int   g_enabled = 0;
 
 static float g_ring[RING_SIZE];
 static int   g_ring_write = 0;
-
 static float g_read_pos = 0.0f;
-
-// smoothing
 static float g_last_sample = 0.0f;
 
 // ============================================================
@@ -64,7 +58,7 @@ return (short)v;
 }
 
 // ============================================================
-// HYBRID DSP (RESAMPLE + SMOOTH)
+// DSP
 // ============================================================
 
 static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*)
@@ -73,14 +67,13 @@ short* s16 = (short*)buf;
 int n = (int)(len / 2);
 if (n <= 0 || n > 4096) return;
 
-// simpan mic ke ring
+// simpan input ke ring
 for (int i = 0; i < n; i++)
     g_ring[(g_ring_write + i) & RING_MASK] = (float)s16[i];
 
 g_ring_write = (g_ring_write + n) & RING_MASK;
 
-if (!g_enabled)
-    return;
+if (!g_enabled) return;
 
 float pos = g_read_pos;
 float pitch = g_pitch;
@@ -89,16 +82,14 @@ for (int i = 0; i < n; i++)
 {
     float s = ring_read(pos);
 
-    // smoothing ringan (anti patah)
+    // smoothing ringan
     float out = (s * 0.85f) + (g_last_sample * 0.15f);
     g_last_sample = out;
 
     s16[i] = clamp16(out);
 
     pos += pitch;
-
-    if (pos >= RING_SIZE)
-        pos -= RING_SIZE;
+    if (pos >= RING_SIZE) pos -= RING_SIZE;
 }
 
 g_read_pos = pos;
@@ -106,14 +97,15 @@ g_read_pos = pos;
 }
 
 // ============================================================
-// HOOK
+// HOOK (FIX POINTER)
 // ============================================================
 
-static HDSP    (pBASSChannelSetDSP)(HRECORD, DSPPROC, void, int)    = nullptr;
-static int     (pBASSChannelRemoveDSP)(HRECORD, HDSP)                = nullptr;
-static HRECORD (orig_BASSRecordStart)(DWORD,DWORD,DWORD,void,void) = nullptr;
-static void*   (pDobbySymbolResolver)(const char, const char*)      = nullptr;
-static int     (pDobbyHook)(void, void*, void**)                    = nullptr;
+static HDSP (pBASSChannelSetDSP)(HRECORD, DSPPROC, void, int) = nullptr;
+static int  (pBASSChannelRemoveDSP)(HRECORD, HDSP) = nullptr;
+static HRECORD (orig_BASSRecordStart)(DWORD, DWORD, DWORD, void, void) = nullptr;
+
+static void* (pDobbySymbolResolver)(const char, const char*) = nullptr;
+static int   (pDobbyHook)(void, void*, void**) = nullptr;
 
 static HRECORD g_recHandle = 0;
 static HDSP    g_dspHandle = 0;
@@ -124,7 +116,6 @@ HRECORD handle = orig_BASSRecordStart(freq, chans, flags, proc, user);
 g_recHandle = handle;
 
 memset(g_ring, 0, sizeof(g_ring));
-
 g_ring_write = 0;
 g_read_pos   = 0.0f;
 g_last_sample = 0.0f;
@@ -170,7 +161,7 @@ _vc_get_pitch,
 };
 
 void* __GetModInfo() {
-static const char* info = "libvoicefx|4.0|VoiceFX Hybrid|brruham";
+static const char* info = "libvoicefx|4.1|VoiceFX Hybrid Fixed|brruham";
 return (void*)info;
 }
 
@@ -187,13 +178,11 @@ if (!hDobby) { logf("[VFX] ERROR: libdobby"); return; }
 
 pDobbySymbolResolver = (void*(*)(const char*,const char*))dlsym(hDobby, "DobbySymbolResolver");
 pDobbyHook           = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
-if (!pDobbySymbolResolver || !pDobbyHook) { logf("[VFX] ERROR: dobby"); return; }
 
 void* hBASS = dlopen("libBASS.so", RTLD_NOW | RTLD_GLOBAL);
 if (!hBASS) { logf("[VFX] ERROR: BASS"); return; }
 
-pBASSChannelSetDSP    = (HDSP(*)(HRECORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
-pBASSChannelRemoveDSP = (int(*)(HRECORD,HDSP))dlsym(hBASS, "BASS_ChannelRemoveDSP");
+pBASSChannelSetDSP = (HDSP(*)(HRECORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
 
 void* addr = pDobbySymbolResolver("libBASS.so", "BASS_RecordStart");
 if (!addr) { logf("[VFX] ERROR: RecordStart"); return; }
@@ -202,13 +191,10 @@ if (pDobbyHook(addr, (void*)hook_BASSRecordStart, (void**)&orig_BASSRecordStart)
     logf("[VFX] ERROR: hook"); return;
 }
 
-g_pitch   = 1.0f;
-g_enabled = 0;
-
 FILE* f = fopen("/storage/emulated/0/voicefx_addr.txt", "w");
 if (f) { fprintf(f, "%lu\n", (unsigned long)&vc_api); fclose(f); }
 
-logf("[VFX] HYBRID READY");
+logf("[VFX] READY");
 
 }
 
