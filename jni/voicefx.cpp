@@ -65,18 +65,10 @@ static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
 
     for (int i = 0; i < n; i++) {
         float srcF = i * factor;
-        int   src0 = (int)srcF;
-        float frac = srcF - src0;
-
-        short s0, s1;
-        if (src0 < n) {
-            s0 = g_buf[src0];
-            s1 = (src0 + 1 < n) ? g_buf[src0 + 1] : g_buf[src0];
-        } else {
-            s0 = s1 = 0;
-        }
-
-        s16[i] = clamp16(s0 * (1.f - frac) + s1 * frac);
+        int   src0 = (int)srcF % n;
+        int   src1 = (src0 + 1) % n;
+        float frac = srcF - (int)srcF;
+        s16[i] = clamp16(g_buf[src0] * (1.f - frac) + g_buf[src1] * frac);
     }
 }
 
