@@ -1,6 +1,6 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
- * Algoritma: simple in-place resample + debug buffer size
+ * Algoritma: simple in-place resample + crossfade di batas wrap
  */
 
 #include <stdint.h>
@@ -27,7 +27,9 @@ typedef void (*DSPPROC)(HDSP, DWORD, void*, DWORD, void*);
 static float g_pitch   = 1.0f;
 static int   g_enabled = 0;
 
-#define MAX_BUF 8192
+#define MAX_BUF  8192
+#define XFADE    64      // crossfade zone samples
+
 static short g_buf[MAX_BUF];
 
 static inline short clamp16(float v) {
@@ -36,33 +38,60 @@ static inline short clamp16(float v) {
     return (short)v;
 }
 
+// ============================================================
+// DSP CALLBACK
+// ============================================================
 static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
     if (!g_enabled || g_pitch == 1.0f) return;
+
     short* s16 = (short*)buf;
     int n = (int)(len / 2);
     if (n <= 0 || n > MAX_BUF) return;
 
-    // Log buffer size sekali saja
-    static int logged = 0;
-    if (!logged) {
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "[VFX] len=%u n=%d", len, n);
-        logf(tmp);
-        logged = 1;
-    }
-
+    // Copy input
     memcpy(g_buf, s16, n * sizeof(short));
 
     float factor = g_pitch;
+
     for (int i = 0; i < n; i++) {
         float srcF = i * factor;
-        int   src0 = (int)srcF % n;
-        int   src1 = (src0 + 1) % n;
-        float frac = srcF - (int)srcF;
-        s16[i] = clamp16(g_buf[src0] * (1.f - frac) + g_buf[src1] * frac);
+
+        // Posisi dalam buffer dengan wrap
+        int   wrap = (int)srcF / n;   // berapa kali sudah wrap
+        float pos  = srcF - wrap * n; // posisi dalam buf [0, n)
+
+        int   p0   = (int)pos;
+        int   p1   = (p0 + 1 < n) ? p0 + 1 : p0;
+        float frac = pos - p0;
+
+        float val = g_buf[p0] * (1.f - frac) + g_buf[p1] * frac;
+
+        // Crossfade di zona wrap (XFADE sample sebelum/sesudah titik wrap)
+        float wrap_pos = fmodf(srcF, (float)n);
+        if (wrap_pos < XFADE) {
+            // Awal setelah wrap — fade in dari sample sebelumnya
+            float alpha = wrap_pos / XFADE;
+            // Sample dari posisi n - XFADE + wrap_pos (akhir buffer)
+            int prev_p = (int)(n - XFADE + wrap_pos);
+            if (prev_p >= n) prev_p = n - 1;
+            float prev_val = g_buf[prev_p];
+            val = prev_val * (1.f - alpha) + val * alpha;
+        } else if (wrap_pos > n - XFADE) {
+            // Akhir sebelum wrap — fade out ke sample awal buffer
+            float alpha = (n - wrap_pos) / XFADE;
+            int next_p = (int)(wrap_pos - (n - XFADE));
+            if (next_p >= n) next_p = n - 1;
+            float next_val = g_buf[next_p];
+            val = val * alpha + next_val * (1.f - alpha);
+        }
+
+        s16[i] = clamp16(val);
     }
 }
 
+// ============================================================
+// HOOK
+// ============================================================
 static HDSP    (*pBASSChannelSetDSP)(HRECORD, DSPPROC, void*, int)    = nullptr;
 static int     (*pBASSChannelRemoveDSP)(HRECORD, HDSP)                = nullptr;
 static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*) = nullptr;
@@ -81,6 +110,9 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
     return handle;
 }
 
+// ============================================================
+// PUBLIC API
+// ============================================================
 static void  _vc_set_pitch(float f) {
     if (f < 0.25f) f = 0.25f;
     if (f > 4.0f)  f = 4.0f;
@@ -110,7 +142,7 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|2.0|VoiceFX|brruham";
+    static const char* info = "libvoicefx|2.1|VoiceFX crossfade|brruham";
     return (void*)info;
 }
 
