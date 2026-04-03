@@ -1,6 +1,7 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
- * Hook: intercept record proc + debug output vs input
+ * Pitch shift dengan ring buffer kontinyu antar frame
+ * Read position bergerak dengan kecepatan pitch_factor
  */
 
 #include <stdint.h>
@@ -11,7 +12,6 @@
 #include <stdio.h>
 
 #define LOG_TAG "libvoicefx"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGFILE "/storage/emulated/0/voicefx_log.txt"
 
 static void logf(const char* msg) {
@@ -28,9 +28,24 @@ typedef int  (*RECORDPROC)(HRECORD, const void*, DWORD, void*);
 static float g_pitch   = 1.0f;
 static int   g_enabled = 0;
 
-#define MAX_BUF 65536
-static short g_buf[MAX_BUF];
-static short g_out[MAX_BUF];
+// Ring buffer — tulis input kontinyu, baca dengan kecepatan pitch
+#define RING_BITS 15
+#define RING_SIZE (1 << RING_BITS)  // 32768
+#define RING_MASK (RING_SIZE - 1)
+
+static float g_ring[RING_SIZE];     // input dalam float
+static int   g_wpos = 0;            // posisi tulis (integer)
+static float g_rpos = 0.0f;         // posisi baca (float, sub-sample)
+
+#define MAX_OUT 65536
+static short g_out[MAX_OUT];
+
+static inline float ring_lerp(float pos) {
+    int   i0   = (int)pos & RING_MASK;
+    int   i1   = (i0 + 1) & RING_MASK;
+    float frac = pos - floorf(pos);
+    return g_ring[i0] * (1.0f - frac) + g_ring[i1] * frac;
+}
 
 static inline short clamp16(float v) {
     if (v >  32767.f) return  32767;
@@ -55,25 +70,45 @@ static int recordProcHook(HRECORD handle, const void* buffer, DWORD length, void
     if (g_enabled && g_pitch != 1.0f && buffer && length > 0) {
         const short* src = (const short*)buffer;
         int n = (int)(length / 2);
-        if (n > 0 && n <= MAX_BUF) {
-            memcpy(g_buf, src, n * sizeof(short));
 
-            float factor = g_pitch;
+        if (n > 0 && n <= MAX_OUT) {
+            // 1. Tulis n sample input ke ring buffer
             for (int i = 0; i < n; i++) {
-                float srcF = i * factor;
-                int   src0 = (int)srcF % n;
-                int   src1 = (src0 + 1) % n;
-                float frac = srcF - (int)srcF;
-                g_out[i] = clamp16(g_buf[src0] * (1.f - frac) + g_buf[src1] * frac);
+                g_ring[(g_wpos + i) & RING_MASK] = (float)src[i];
+            }
+            g_wpos = (g_wpos + n) & RING_MASK;
+
+            // 2. Pastikan rpos tidak terlalu jauh tertinggal
+            // rpos harus dalam window [wpos - RING_SIZE/2, wpos]
+            float wposF = (float)g_wpos;
+            float diff  = wposF - g_rpos;
+            if (diff < 0) diff += RING_SIZE;
+            if (diff > RING_SIZE * 0.75f || diff < 0) {
+                // Reset rpos ke n frame sebelum wpos
+                g_rpos = (float)((g_wpos - n * 2 + RING_SIZE) & RING_MASK);
             }
 
-            // Debug: bandingkan sample pertama
+            // 3. Baca n sample dari ring dengan kecepatan pitch_factor
+            float factor = g_pitch;
+            float rpos   = g_rpos;
+
+            for (int i = 0; i < n; i++) {
+                g_out[i] = clamp16(ring_lerp(rpos));
+                rpos += factor;
+                // Wrap dalam RING_SIZE
+                if (rpos >= RING_SIZE) rpos -= RING_SIZE;
+            }
+
+            g_rpos = rpos;
+
+            // Debug sekali
             static int log2 = 0;
             if (!log2) {
                 log2 = 1;
                 char tmp[128];
-                snprintf(tmp, sizeof(tmp), "[VFX] in[0]=%d in[1]=%d out[0]=%d out[1]=%d n=%d pitch=%.2f",
-                    g_buf[0], g_buf[1], g_out[0], g_out[1], n, g_pitch);
+                snprintf(tmp, sizeof(tmp),
+                    "[VFX] in[0]=%d out[0]=%d in[100]=%d out[100]=%d",
+                    src[0], g_out[0], src[100], g_out[100]);
                 logf(tmp);
             }
 
@@ -86,8 +121,6 @@ static int recordProcHook(HRECORD handle, const void* buffer, DWORD length, void
     return 1;
 }
 
-static HDSP    (*pBASSChannelSetDSP)(HRECORD, DSPPROC, void*, int)    = nullptr;
-static int     (*pBASSChannelRemoveDSP)(HRECORD, HDSP)                = nullptr;
 static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*) = nullptr;
 static void*   (*pDobbySymbolResolver)(const char*, const char*)       = nullptr;
 static int     (*pDobbyHook)(void*, void*, void**)                     = nullptr;
@@ -98,11 +131,16 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
     g_origProc = (RECORDPROC)proc;
     g_origUser = user;
 
+    // Reset ring buffer
+    memset(g_ring, 0, sizeof(g_ring));
+    g_wpos = 0;
+    g_rpos = 0.0f;
+
     HRECORD handle = orig_BASSRecordStart(freq, chans, flags, (void*)recordProcHook, user);
     g_recHandle = handle;
 
-    char tmp[128];
-    snprintf(tmp, sizeof(tmp), "[VFX] hooked! handle=%u freq=%u", handle, freq);
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "[VFX] hooked handle=%u freq=%u", handle, freq);
     logf(tmp);
     return handle;
 }
@@ -111,6 +149,8 @@ static void  _vc_set_pitch(float f) {
     if (f < 0.25f) f = 0.25f;
     if (f > 4.0f)  f = 4.0f;
     g_pitch = f;
+    // Reset posisi saat pitch berubah
+    g_rpos = (float)((g_wpos - 512 + RING_SIZE) & RING_MASK);
 }
 static void  _vc_enable(void)     { g_enabled = 1; }
 static void  _vc_disable(void)    { g_enabled = 0; }
@@ -136,7 +176,7 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|2.0|VoiceFX|brruham";
+    static const char* info = "libvoicefx|3.0|VoiceFX ring buffer|brruham";
     return (void*)info;
 }
 
@@ -157,9 +197,6 @@ void OnModLoad() {
 
     void* hBASS = dlopen("libBASS.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hBASS) { logf("[VFX] ERROR: libBASS"); return; }
-
-    pBASSChannelSetDSP    = (HDSP(*)(HRECORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
-    pBASSChannelRemoveDSP = (int(*)(HRECORD,HDSP))dlsym(hBASS, "BASS_ChannelRemoveDSP");
 
     void* addr = pDobbySymbolResolver("libBASS.so", "BASS_RecordStart");
     if (!addr) { logf("[VFX] ERROR: BASS_RecordStart"); return; }
