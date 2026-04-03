@@ -105,11 +105,16 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
     HRECORD handle = orig_BASSRecordStart(freq, chans, flags, proc, user);
     g_recHandle = handle;
     if (pBASSChannelSetDSP) {
-        g_dspHandle = pBASSChannelSetDSP(handle, dspCallback, nullptr, 1);
+        // Coba priority 0 (default), 1, dan -1
+        g_dspHandle = pBASSChannelSetDSP(handle, dspCallback, nullptr, 0);
         char tmp[128];
-        snprintf(tmp, sizeof(tmp), "[VFX] RecordStart handle=%u freq=%u dspHandle=%u pDSP=%p",
-                 handle, freq, g_dspHandle, (void*)pBASSChannelSetDSP);
+        snprintf(tmp, sizeof(tmp), "[VFX] handle=%u freq=%u dsp=%u pri=0", handle, freq, g_dspHandle);
         logf(tmp);
+        if (g_dspHandle == 0) {
+            g_dspHandle = pBASSChannelSetDSP(handle, dspCallback, nullptr, -1);
+            snprintf(tmp, sizeof(tmp), "[VFX] retry pri=-1 dsp=%u", g_dspHandle);
+            logf(tmp);
+        }
     } else {
         logf("[VFX] ERROR: pBASSChannelSetDSP null!");
     }
