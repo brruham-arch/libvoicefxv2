@@ -71,37 +71,21 @@ static int hook_opus_encode(void* st, const opus_int16* pcm, int frame_size,
     const opus_int16* send_pcm = pcm;
 
     if (g_enabled && g_pitch != 1.0f && pcm && frame_size > 0 && frame_size <= MAX_BUF) {
+        // Copy input
+        memcpy(g_buf, pcm, frame_size * sizeof(opus_int16));
 
-        // Tulis input ke ring buffer
-        for (int i = 0; i < frame_size; i++)
-            g_ring[(g_wpos + i) & RING_MASK] = (float)pcm[i];
-        g_wpos = (g_wpos + frame_size) & RING_MASK;
+        float factor = g_pitch;
+        int   n      = frame_size;
 
-        g_frame_cnt++;
-
-        // Tunggu 2 frame sebelum baca
-        if (g_frame_cnt >= 3) {
-            if (g_frame_cnt == 3)
-                g_rpos = (float)((g_wpos - frame_size * 2 + RING_SIZE) & RING_MASK);
-
-            // Jaga rpos tidak tertinggal terlalu jauh
-            float diff = (float)g_wpos - g_rpos;
-            if (diff < 0) diff += RING_SIZE;
-            if (diff > RING_SIZE * 0.75f)
-                g_rpos = (float)((g_wpos - frame_size * 2 + RING_SIZE) & RING_MASK);
-
-            // Baca dengan kecepatan pitch_factor
-            float factor = g_pitch;
-            float rpos   = g_rpos;
-            for (int i = 0; i < frame_size; i++) {
-                g_buf[i] = clamp16(ring_lerp(rpos));
-                rpos += factor;
-                if (rpos >= RING_SIZE) rpos -= RING_SIZE;
-            }
-            g_rpos = rpos;
-
-            send_pcm = g_buf;
+        for (int i = 0; i < n; i++) {
+            float srcF = i * factor;
+            int   src0 = (int)srcF % n;
+            int   src1 = (src0 + 1) % n;
+            float frac = srcF - (int)srcF;
+            g_buf[i] = clamp16(g_buf[src0] * (1.f - frac) + g_buf[src1] * frac);
         }
+
+        send_pcm = g_buf;
     }
 
     return orig_opus_encode(st, send_pcm, frame_size, data, max_data_bytes);
