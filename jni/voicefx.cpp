@@ -108,6 +108,9 @@ typedef int (*RECORDPROC)(HRECORD, const void*, DWORD, void*);
 static RECORDPROC g_origProc = nullptr;
 static void*      g_origUser = nullptr;
 
+// Buffer output terpisah untuk hasil pitch
+static short g_out[MAX_BUF];
+
 // Wrapper record proc — intercept langsung di callback SAMP
 static int recordProcHook(HRECORD handle, const void* buffer, DWORD length, void* user) {
     // Log pertama kali
@@ -119,28 +122,34 @@ static int recordProcHook(HRECORD handle, const void* buffer, DWORD length, void
         logf(tmp);
     }
 
+    const void* send_buf = buffer;
+
     // Proses pitch jika enabled
     if (g_enabled && g_pitch != 1.0f && buffer && length > 0) {
-        short* s16 = (short*)buffer;
+        const short* src = (const short*)buffer;
         int n = (int)(length / 2);
         if (n > 0 && n <= MAX_BUF) {
-            memcpy(g_buf, s16, n * sizeof(short));
+            // Copy input ke g_buf
+            memcpy(g_buf, src, n * sizeof(short));
+
             float factor = g_pitch;
             for (int i = 0; i < n; i++) {
                 float srcF = i * factor;
                 int   src0 = (int)srcF % n;
                 int   src1 = (src0 + 1) % n;
                 float frac = srcF - (int)srcF;
-                // Cast away const — kita modifikasi buffer in-place
-                ((short*)buffer)[i] = clamp16(g_buf[src0] * (1.f - frac) + g_buf[src1] * frac);
+                g_out[i] = clamp16(g_buf[src0] * (1.f - frac) + g_buf[src1] * frac);
             }
+
+            // Kirim g_out bukan buffer asli
+            send_buf = (const void*)g_out;
         }
     }
 
-    // Teruskan ke callback asli SAMP
+    // Teruskan ke callback asli SAMP dengan buffer hasil pitch
     if (g_origProc)
-        return g_origProc(handle, buffer, length, g_origUser);
-    return 1; // TRUE = lanjut recording
+        return g_origProc(handle, send_buf, length, g_origUser);
+    return 1;
 }
 
 static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* proc, void* user) {
