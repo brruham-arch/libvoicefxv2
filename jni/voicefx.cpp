@@ -27,7 +27,8 @@ static float g_pitch   = 1.0f;
 static int   g_enabled = 0;
 
 #define MAX_BUF 65536
-static opus_int16 g_buf[MAX_BUF];
+static opus_int16 g_buf[MAX_BUF];  // output
+static opus_int16 g_in[MAX_BUF];   // input copy
 
 // Ring buffer untuk persistent read position
 #define RING_BITS 15
@@ -71,8 +72,8 @@ static int hook_opus_encode(void* st, const opus_int16* pcm, int frame_size,
     const opus_int16* send_pcm = pcm;
 
     if (g_enabled && g_pitch != 1.0f && pcm && frame_size > 0 && frame_size <= MAX_BUF) {
-        // Copy input
-        memcpy(g_buf, pcm, frame_size * sizeof(opus_int16));
+        // Copy input ke g_in dulu (hindari baca dari buffer yang sudah dimodifikasi)
+        memcpy(g_in, pcm, frame_size * sizeof(opus_int16));
 
         float factor = g_pitch;
         int   n      = frame_size;
@@ -82,7 +83,7 @@ static int hook_opus_encode(void* st, const opus_int16* pcm, int frame_size,
             int   src0 = (int)srcF % n;
             int   src1 = (src0 + 1) % n;
             float frac = srcF - (int)srcF;
-            g_buf[i] = clamp16(g_buf[src0] * (1.f - frac) + g_buf[src1] * frac);
+            g_buf[i] = clamp16(g_in[src0] * (1.f - frac) + g_in[src1] * frac);
         }
 
         send_pcm = g_buf;
