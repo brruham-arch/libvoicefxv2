@@ -1,7 +1,7 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
- * Hook: opus_encode + ring buffer antar frame
- * Sisa frame tidak dibuang, disambung ke frame berikutnya
+ * Hook: opus_encode
+ * Algoritma: resample per-frame + crossfade 64 sample antar frame
  */
 
 #include <stdint.h>
@@ -26,25 +26,14 @@ typedef short        opus_int16;
 static float g_pitch   = 1.0f;
 static int   g_enabled = 0;
 
-// Ring buffer input — tulis semua PCM masuk
-#define RING_BITS 16
-#define RING_SIZE (1 << RING_BITS)  // 65536
-#define RING_MASK (RING_SIZE - 1)
+#define MAX_BUF  65536
+#define XFADE    64
 
-static float g_ring[RING_SIZE];
-static int   g_wpos = 0;       // posisi tulis (integer)
-static float g_rpos = 0.0f;    // posisi baca (float, sub-sample)
-static int   g_init = 0;       // apakah ring sudah diinisialisasi
-
-#define MAX_OUT 65536
-static opus_int16 g_out[MAX_OUT];
-
-static inline float ring_lerp(float pos) {
-    int   i0   = (int)pos & RING_MASK;
-    int   i1   = (i0 + 1) & RING_MASK;
-    float frac = pos - floorf(pos);
-    return g_ring[i0] * (1.0f - frac) + g_ring[i1] * frac;
-}
+static opus_int16 g_in[MAX_BUF];
+static opus_int16 g_out[MAX_BUF];
+// Simpan XFADE sample akhir dari frame sebelumnya untuk crossfade
+static float      g_prev[XFADE];
+static int        g_have_prev = 0;
 
 static inline opus_int16 clamp16(float v) {
     if (v >  32767.f) return  32767;
@@ -67,42 +56,44 @@ static int hook_opus_encode(void* st, const opus_int16* pcm, int frame_size,
 
     const opus_int16* send_pcm = pcm;
 
-    if (g_enabled && g_pitch != 1.0f && pcm && frame_size > 0 && frame_size <= MAX_OUT) {
+    if (g_enabled && g_pitch != 1.0f && pcm && frame_size > 0 && frame_size <= MAX_BUF) {
 
-        // 1. Tulis frame baru ke ring buffer
-        for (int i = 0; i < frame_size; i++)
-            g_ring[(g_wpos + i) & RING_MASK] = (float)pcm[i];
-        g_wpos = (g_wpos + frame_size) & RING_MASK;
+        // Copy input ke buffer terpisah
+        memcpy(g_in, pcm, frame_size * sizeof(opus_int16));
 
-        // 2. Inisialisasi rpos — mulai baca 1 frame sebelum wpos
-        if (!g_init) {
-            g_init = 1;
-            g_rpos = (float)((g_wpos - frame_size + RING_SIZE) & RING_MASK);
-        }
-
-        // 3. Jaga rpos tidak terlalu jauh tertinggal atau mendahului
-        float wposF = (float)g_wpos;
-        float diff  = wposF - g_rpos;
-        if (diff < 0) diff += RING_SIZE;
-        // Kalau tertinggal > setengah ring, skip ke posisi aman
-        if (diff > RING_SIZE * 0.5f) {
-            g_rpos = (float)((g_wpos - frame_size + RING_SIZE) & RING_MASK);
-        }
-
-        // 4. Baca frame_size sample dengan kecepatan pitch_factor
         float factor = g_pitch;
-        float rpos   = g_rpos;
+        int   n      = frame_size;
 
-        for (int i = 0; i < frame_size; i++) {
-            g_out[i] = clamp16(ring_lerp(rpos));
-            rpos    += factor;
-            if (rpos >= RING_SIZE) rpos -= RING_SIZE;
+        // Resample
+        for (int i = 0; i < n; i++) {
+            float srcF = i * factor;
+            int   src0 = (int)srcF;
+            int   src1 = src0 + 1;
+            float frac = srcF - src0;
+
+            if (src0 >= n) { g_out[i] = 0; continue; }
+            if (src1 >= n)   src1 = n - 1;
+
+            g_out[i] = clamp16(g_in[src0] * (1.f - frac) + g_in[src1] * frac);
         }
 
-        // 5. Simpan rpos untuk frame berikutnya — TIDAK direset
-        g_rpos = rpos;
+        // Crossfade XFADE sample pertama dengan akhir frame sebelumnya
+        if (g_have_prev) {
+            for (int i = 0; i < XFADE && i < n; i++) {
+                float alpha = (float)i / XFADE;
+                g_out[i] = clamp16(g_prev[i] * (1.f - alpha) + g_out[i] * alpha);
+            }
+        }
+
+        // Simpan XFADE sample terakhir untuk frame berikutnya
+        for (int i = 0; i < XFADE; i++)
+            g_prev[i] = (float)g_out[n - XFADE + i];
+        g_have_prev = 1;
 
         send_pcm = g_out;
+    } else {
+        // Jika disabled, reset prev agar tidak ada ghost saat ON lagi
+        g_have_prev = 0;
     }
 
     return orig_opus_encode(st, send_pcm, frame_size, data, max_data_bytes);
@@ -114,11 +105,11 @@ static int   (*pDobbyHook)(void*, void*, void**)               = nullptr;
 static void _vc_set_pitch(float f) {
     if (f < 0.25f) f = 0.25f;
     if (f > 4.0f)  f = 4.0f;
-    g_pitch = f;
-    g_init  = 0; // reset posisi saat pitch berubah
+    g_pitch     = f;
+    g_have_prev = 0;
 }
-static void  _vc_enable(void)     { g_enabled = 1; g_init = 0; }
-static void  _vc_disable(void)    { g_enabled = 0; }
+static void  _vc_enable(void)     { g_enabled = 1; g_have_prev = 0; }
+static void  _vc_disable(void)    { g_enabled = 0; g_have_prev = 0; }
 static int   _vc_is_enabled(void) { return g_enabled; }
 static float _vc_get_pitch(void)  { return g_pitch; }
 
@@ -141,7 +132,7 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|4.0|VoiceFX ring buffer|brruham";
+    static const char* info = "libvoicefx|4.1|VoiceFX crossfade|brruham";
     return (void*)info;
 }
 
@@ -167,10 +158,7 @@ void OnModLoad() {
         logf("[VFX] ERROR: DobbyHook"); return;
     }
 
-    g_pitch = 1.0f;
-    g_enabled = 0;
-    memset(g_ring, 0, sizeof(g_ring));
-    g_wpos = 0; g_rpos = 0.0f; g_init = 0;
+    g_pitch = 1.0f; g_enabled = 0; g_have_prev = 0;
 
     FILE* af = fopen("/storage/emulated/0/voicefx_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&vc_api); fclose(af); }
