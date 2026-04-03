@@ -77,13 +77,25 @@ static int hook_opus_encode(void* st, const opus_int16* pcm, int frame_size,
 
         float factor = g_pitch;
         int   n      = frame_size;
+        // Hitung berapa sample valid sebelum wrap
+        // srcF = i * factor < n  →  i < n / factor
+        int   valid  = (int)(n / factor);
+        if (valid > n) valid = n;
 
+        opus_int16 last = 0;
         for (int i = 0; i < n; i++) {
-            float srcF = i * factor;
-            int   src0 = (int)srcF % n;
-            int   src1 = (src0 + 1) % n;
-            float frac = srcF - (int)srcF;
-            g_buf[i] = clamp16(g_in[src0] * (1.f - frac) + g_in[src1] * frac);
+            if (i < valid) {
+                float srcF = i * factor;
+                int   src0 = (int)srcF;
+                int   src1 = (src0 + 1 < n) ? src0 + 1 : src0;
+                float frac = srcF - src0;
+                last = clamp16(g_in[src0] * (1.f - frac) + g_in[src1] * frac);
+                g_buf[i] = last;
+            } else {
+                // Fade out ke silence setelah sample valid habis
+                float alpha = 1.0f - (float)(i - valid) / (float)(n - valid + 1);
+                g_buf[i] = clamp16(last * alpha);
+            }
         }
 
         send_pcm = g_buf;
