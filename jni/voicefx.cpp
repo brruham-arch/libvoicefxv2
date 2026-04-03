@@ -1,6 +1,7 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
- * Hook: opus_encode di libsamp.so — pitch shift sebelum encode
+ * Hook: opus_encode + ring buffer antar frame
+ * Sisa frame tidak dibuang, disambung ke frame berikutnya
  */
 
 #include <stdint.h>
@@ -18,27 +19,25 @@ static void logf(const char* msg) {
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
-typedef unsigned int   DWORD;
-typedef unsigned int   HRECORD;
-typedef int            opus_int32;
-typedef short          opus_int16;
+typedef unsigned int DWORD;
+typedef int          opus_int32;
+typedef short        opus_int16;
 
 static float g_pitch   = 1.0f;
 static int   g_enabled = 0;
 
-#define MAX_BUF 65536
-static opus_int16 g_buf[MAX_BUF];  // output
-static opus_int16 g_in[MAX_BUF];   // input copy
-
-// Ring buffer untuk persistent read position
-#define RING_BITS 15
-#define RING_SIZE (1 << RING_BITS)  // 32768
+// Ring buffer input — tulis semua PCM masuk
+#define RING_BITS 16
+#define RING_SIZE (1 << RING_BITS)  // 65536
 #define RING_MASK (RING_SIZE - 1)
 
 static float g_ring[RING_SIZE];
-static int   g_wpos      = 0;
-static float g_rpos      = 0.0f;
-static int   g_frame_cnt = 0;
+static int   g_wpos = 0;       // posisi tulis (integer)
+static float g_rpos = 0.0f;    // posisi baca (float, sub-sample)
+static int   g_init = 0;       // apakah ring sudah diinisialisasi
+
+#define MAX_OUT 65536
+static opus_int16 g_out[MAX_OUT];
 
 static inline float ring_lerp(float pos) {
     int   i0   = (int)pos & RING_MASK;
@@ -53,60 +52,75 @@ static inline opus_int16 clamp16(float v) {
     return (opus_int16)v;
 }
 
-// opus_encode original
 typedef int (*opus_encode_t)(void*, const opus_int16*, int, unsigned char*, opus_int32);
 static opus_encode_t orig_opus_encode = nullptr;
 
-// Hook opus_encode
 static int hook_opus_encode(void* st, const opus_int16* pcm, int frame_size,
                              unsigned char* data, opus_int32 max_data_bytes) {
-
     static int first = 0;
     if (!first) {
         first = 1;
         char tmp[64];
-        snprintf(tmp, sizeof(tmp), "[VFX] opus_encode! frame_size=%d", frame_size);
+        snprintf(tmp, sizeof(tmp), "[VFX] opus_encode frame_size=%d", frame_size);
         logf(tmp);
     }
 
     const opus_int16* send_pcm = pcm;
 
-    if (g_enabled && g_pitch != 1.0f && pcm && frame_size > 0 && frame_size <= MAX_BUF) {
-        // Copy input ke g_in dulu (hindari baca dari buffer yang sudah dimodifikasi)
-        memcpy(g_in, pcm, frame_size * sizeof(opus_int16));
+    if (g_enabled && g_pitch != 1.0f && pcm && frame_size > 0 && frame_size <= MAX_OUT) {
 
-        float factor = g_pitch;
-        int   n      = frame_size;
-        // Hitung berapa sample valid sebelum wrap
-        // srcF = i * factor < n  →  i < n / factor
-        int   valid  = (int)(n / factor);
-        if (valid > n) valid = n;
+        // 1. Tulis frame baru ke ring buffer
+        for (int i = 0; i < frame_size; i++)
+            g_ring[(g_wpos + i) & RING_MASK] = (float)pcm[i];
+        g_wpos = (g_wpos + frame_size) & RING_MASK;
 
-        opus_int16 last = 0;
-        for (int i = 0; i < n; i++) {
-            if (i < valid) {
-                float srcF = i * factor;
-                int   src0 = (int)srcF;
-                int   src1 = (src0 + 1 < n) ? src0 + 1 : src0;
-                float frac = srcF - src0;
-                last = clamp16(g_in[src0] * (1.f - frac) + g_in[src1] * frac);
-                g_buf[i] = last;
-            } else {
-                // Fade out ke silence setelah sample valid habis
-                float alpha = 1.0f - (float)(i - valid) / (float)(n - valid + 1);
-                g_buf[i] = clamp16(last * alpha);
-            }
+        // 2. Inisialisasi rpos — mulai baca 1 frame sebelum wpos
+        if (!g_init) {
+            g_init = 1;
+            g_rpos = (float)((g_wpos - frame_size + RING_SIZE) & RING_MASK);
         }
 
-        send_pcm = g_buf;
+        // 3. Jaga rpos tidak terlalu jauh tertinggal atau mendahului
+        float wposF = (float)g_wpos;
+        float diff  = wposF - g_rpos;
+        if (diff < 0) diff += RING_SIZE;
+        // Kalau tertinggal > setengah ring, skip ke posisi aman
+        if (diff > RING_SIZE * 0.5f) {
+            g_rpos = (float)((g_wpos - frame_size + RING_SIZE) & RING_MASK);
+        }
+
+        // 4. Baca frame_size sample dengan kecepatan pitch_factor
+        float factor = g_pitch;
+        float rpos   = g_rpos;
+
+        for (int i = 0; i < frame_size; i++) {
+            g_out[i] = clamp16(ring_lerp(rpos));
+            rpos    += factor;
+            if (rpos >= RING_SIZE) rpos -= RING_SIZE;
+        }
+
+        // 5. Simpan rpos untuk frame berikutnya — TIDAK direset
+        g_rpos = rpos;
+
+        send_pcm = g_out;
     }
 
     return orig_opus_encode(st, send_pcm, frame_size, data, max_data_bytes);
 }
 
-// Dobby
 static void* (*pDobbySymbolResolver)(const char*, const char*) = nullptr;
 static int   (*pDobbyHook)(void*, void*, void**)               = nullptr;
+
+static void _vc_set_pitch(float f) {
+    if (f < 0.25f) f = 0.25f;
+    if (f > 4.0f)  f = 4.0f;
+    g_pitch = f;
+    g_init  = 0; // reset posisi saat pitch berubah
+}
+static void  _vc_enable(void)     { g_enabled = 1; g_init = 0; }
+static void  _vc_disable(void)    { g_enabled = 0; }
+static int   _vc_is_enabled(void) { return g_enabled; }
+static float _vc_get_pitch(void)  { return g_pitch; }
 
 struct VcAPI {
     void  (*set_pitch)(float);
@@ -115,19 +129,6 @@ struct VcAPI {
     int   (*is_enabled)(void);
     float (*get_pitch)(void);
 };
-
-static void _vc_set_pitch(float f) {
-    if (f < 0.25f) f = 0.25f;
-    if (f > 4.0f)  f = 4.0f;
-    g_pitch = f;
-    // Reset ring saat pitch berubah
-    g_frame_cnt = 0;
-    g_rpos = (float)((g_wpos - 512 + RING_SIZE) & RING_MASK);
-}
-static void  _vc_enable(void)     { g_enabled = 1; g_frame_cnt = 0; }
-static void  _vc_disable(void)    { g_enabled = 0; }
-static int   _vc_is_enabled(void) { return g_enabled; }
-static float _vc_get_pitch(void)  { return g_pitch; }
 
 extern "C" {
 
@@ -140,7 +141,7 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|3.0|VoiceFX opus hook|brruham";
+    static const char* info = "libvoicefx|4.0|VoiceFX ring buffer|brruham";
     return (void*)info;
 }
 
@@ -159,30 +160,22 @@ void OnModLoad() {
     pDobbyHook           = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
     if (!pDobbySymbolResolver || !pDobbyHook) { logf("[VFX] ERROR: Dobby sym"); return; }
 
-    // Hook opus_encode di libsamp.so
     void* addr = pDobbySymbolResolver("libsamp.so", "opus_encode");
-    if (!addr) {
-        logf("[VFX] ERROR: opus_encode tidak ditemukan di libsamp.so");
-        return;
-    }
-
-    char tmp[64];
-    snprintf(tmp, sizeof(tmp), "[VFX] opus_encode addr=%p", addr);
-    logf(tmp);
+    if (!addr) { logf("[VFX] ERROR: opus_encode"); return; }
 
     if (pDobbyHook(addr, (void*)hook_opus_encode, (void**)&orig_opus_encode) != 0) {
-        logf("[VFX] ERROR: DobbyHook opus_encode gagal"); return;
+        logf("[VFX] ERROR: DobbyHook"); return;
     }
 
-    g_pitch   = 1.0f;
+    g_pitch = 1.0f;
     g_enabled = 0;
     memset(g_ring, 0, sizeof(g_ring));
-    g_wpos = 0; g_rpos = 0.0f; g_frame_cnt = 0;
+    g_wpos = 0; g_rpos = 0.0f; g_init = 0;
 
     FILE* af = fopen("/storage/emulated/0/voicefx_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&vc_api); fclose(af); }
 
-    logf("[VFX] OnModLoad SELESAI - hook opus_encode!");
+    logf("[VFX] OnModLoad SELESAI!");
 }
 
 } // extern "C"
