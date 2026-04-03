@@ -101,23 +101,60 @@ static int     (*pDobbyHook)(void*, void*, void**)                     = nullptr
 static HRECORD g_recHandle = 0;
 static HDSP    g_dspHandle = 0;
 
-static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* proc, void* user) {
-    HRECORD handle = orig_BASSRecordStart(freq, chans, flags, proc, user);
-    g_recHandle = handle;
-    if (pBASSChannelSetDSP) {
-        // Coba priority 0 (default), 1, dan -1
-        g_dspHandle = pBASSChannelSetDSP(handle, dspCallback, nullptr, 0);
-        char tmp[128];
-        snprintf(tmp, sizeof(tmp), "[VFX] handle=%u freq=%u dsp=%u pri=0", handle, freq, g_dspHandle);
+// Tipe record callback BASS
+// BOOL CALLBACK RecordProc(HRECORD handle, const void* buffer, DWORD length, void* user)
+typedef int (*RECORDPROC)(HRECORD, const void*, DWORD, void*);
+
+static RECORDPROC g_origProc = nullptr;
+static void*      g_origUser = nullptr;
+
+// Wrapper record proc — intercept langsung di callback SAMP
+static int recordProcHook(HRECORD handle, const void* buffer, DWORD length, void* user) {
+    // Log pertama kali
+    static int first = 0;
+    if (!first) {
+        first = 1;
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "[VFX] recordProc! len=%u", length);
         logf(tmp);
-        if (g_dspHandle == 0) {
-            g_dspHandle = pBASSChannelSetDSP(handle, dspCallback, nullptr, -1);
-            snprintf(tmp, sizeof(tmp), "[VFX] retry pri=-1 dsp=%u", g_dspHandle);
-            logf(tmp);
-        }
-    } else {
-        logf("[VFX] ERROR: pBASSChannelSetDSP null!");
     }
+
+    // Proses pitch jika enabled
+    if (g_enabled && g_pitch != 1.0f && buffer && length > 0) {
+        short* s16 = (short*)buffer;
+        int n = (int)(length / 2);
+        if (n > 0 && n <= MAX_BUF) {
+            memcpy(g_buf, s16, n * sizeof(short));
+            float factor = g_pitch;
+            for (int i = 0; i < n; i++) {
+                float srcF = i * factor;
+                int   src0 = (int)srcF % n;
+                int   src1 = (src0 + 1) % n;
+                float frac = srcF - (int)srcF;
+                // Cast away const — kita modifikasi buffer in-place
+                ((short*)buffer)[i] = clamp16(g_buf[src0] * (1.f - frac) + g_buf[src1] * frac);
+            }
+        }
+    }
+
+    // Teruskan ke callback asli SAMP
+    if (g_origProc)
+        return g_origProc(handle, buffer, length, g_origUser);
+    return 1; // TRUE = lanjut recording
+}
+
+static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* proc, void* user) {
+    // Simpan proc asli, ganti dengan wrapper kita
+    g_origProc = (RECORDPROC)proc;
+    g_origUser = user;
+
+    // Panggil RecordStart dengan proc kita
+    HRECORD handle = orig_BASSRecordStart(freq, chans, flags, (void*)recordProcHook, user);
+    g_recHandle = handle;
+
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp), "[VFX] RecordStart hooked via proc! handle=%u freq=%u", handle, freq);
+    logf(tmp);
     return handle;
 }
 
