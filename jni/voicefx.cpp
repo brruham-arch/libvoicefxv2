@@ -1,6 +1,6 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
- * Algoritma: simple in-place resample
+ * Algoritma: simple in-place resample + debug buffer size
  */
 
 #include <stdint.h>
@@ -41,6 +41,15 @@ static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
     short* s16 = (short*)buf;
     int n = (int)(len / 2);
     if (n <= 0 || n > MAX_BUF) return;
+
+    // Log buffer size sekali saja
+    static int logged = 0;
+    if (!logged) {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "[VFX] len=%u n=%d", len, n);
+        logf(tmp);
+        logged = 1;
+    }
 
     memcpy(g_buf, s16, n * sizeof(short));
 
@@ -101,7 +110,7 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|2.0|VoiceFX simple resample|brruham";
+    static const char* info = "libvoicefx|2.0|VoiceFX|brruham";
     return (void*)info;
 }
 
