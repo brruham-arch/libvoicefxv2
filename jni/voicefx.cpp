@@ -1,6 +1,6 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
- * Algoritma: simple in-place resample + crossfade di batas wrap
+ * Hook: intercept record proc + debug output vs input
  */
 
 #include <stdint.h>
@@ -23,14 +23,14 @@ typedef unsigned int DWORD;
 typedef unsigned int HRECORD;
 typedef unsigned int HDSP;
 typedef void (*DSPPROC)(HDSP, DWORD, void*, DWORD, void*);
+typedef int  (*RECORDPROC)(HRECORD, const void*, DWORD, void*);
 
 static float g_pitch   = 1.0f;
 static int   g_enabled = 0;
 
-#define MAX_BUF  8192
-#define XFADE    64      // crossfade zone samples
-
+#define MAX_BUF 65536
 static short g_buf[MAX_BUF];
+static short g_out[MAX_BUF];
 
 static inline short clamp16(float v) {
     if (v >  32767.f) return  32767;
@@ -38,98 +38,24 @@ static inline short clamp16(float v) {
     return (short)v;
 }
 
-// ============================================================
-// DSP CALLBACK
-// ============================================================
-static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
-    if (!g_enabled || g_pitch == 1.0f) return;
-
-    short* s16 = (short*)buf;
-    int n = (int)(len / 2);
-    if (n <= 0 || n > MAX_BUF) return;
-
-    // Copy input
-    memcpy(g_buf, s16, n * sizeof(short));
-
-    float factor = g_pitch;
-
-    for (int i = 0; i < n; i++) {
-        float srcF = i * factor;
-
-        // Posisi dalam buffer dengan wrap
-        int   wrap = (int)srcF / n;   // berapa kali sudah wrap
-        float pos  = srcF - wrap * n; // posisi dalam buf [0, n)
-
-        int   p0   = (int)pos;
-        int   p1   = (p0 + 1 < n) ? p0 + 1 : p0;
-        float frac = pos - p0;
-
-        float val = g_buf[p0] * (1.f - frac) + g_buf[p1] * frac;
-
-        // Crossfade di zona wrap (XFADE sample sebelum/sesudah titik wrap)
-        float wrap_pos = fmodf(srcF, (float)n);
-        if (wrap_pos < XFADE) {
-            // Awal setelah wrap — fade in dari sample sebelumnya
-            float alpha = wrap_pos / XFADE;
-            // Sample dari posisi n - XFADE + wrap_pos (akhir buffer)
-            int prev_p = (int)(n - XFADE + wrap_pos);
-            if (prev_p >= n) prev_p = n - 1;
-            float prev_val = g_buf[prev_p];
-            val = prev_val * (1.f - alpha) + val * alpha;
-        } else if (wrap_pos > n - XFADE) {
-            // Akhir sebelum wrap — fade out ke sample awal buffer
-            float alpha = (n - wrap_pos) / XFADE;
-            int next_p = (int)(wrap_pos - (n - XFADE));
-            if (next_p >= n) next_p = n - 1;
-            float next_val = g_buf[next_p];
-            val = val * alpha + next_val * (1.f - alpha);
-        }
-
-        s16[i] = clamp16(val);
-    }
-}
-
-// ============================================================
-// HOOK
-// ============================================================
-static HDSP    (*pBASSChannelSetDSP)(HRECORD, DSPPROC, void*, int)    = nullptr;
-static int     (*pBASSChannelRemoveDSP)(HRECORD, HDSP)                = nullptr;
-static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*) = nullptr;
-static void*   (*pDobbySymbolResolver)(const char*, const char*)       = nullptr;
-static int     (*pDobbyHook)(void*, void*, void**)                     = nullptr;
-
-static HRECORD g_recHandle = 0;
-static HDSP    g_dspHandle = 0;
-
-// Tipe record callback BASS
-// BOOL CALLBACK RecordProc(HRECORD handle, const void* buffer, DWORD length, void* user)
-typedef int (*RECORDPROC)(HRECORD, const void*, DWORD, void*);
-
 static RECORDPROC g_origProc = nullptr;
 static void*      g_origUser = nullptr;
 
-// Buffer output terpisah untuk hasil pitch
-static short g_out[MAX_BUF];
-
-// Wrapper record proc — intercept langsung di callback SAMP
 static int recordProcHook(HRECORD handle, const void* buffer, DWORD length, void* user) {
-    // Log pertama kali
     static int first = 0;
     if (!first) {
         first = 1;
         char tmp[64];
-        snprintf(tmp, sizeof(tmp), "[VFX] recordProc! len=%u", length);
+        snprintf(tmp, sizeof(tmp), "[VFX] recordProc len=%u", length);
         logf(tmp);
     }
 
     const void* send_buf = buffer;
 
-    // Proses pitch jika enabled
     if (g_enabled && g_pitch != 1.0f && buffer && length > 0) {
         const short* src = (const short*)buffer;
         int n = (int)(length / 2);
         if (n > 0 && n <= MAX_BUF) {
-            // Copy input ke g_buf
             memcpy(g_buf, src, n * sizeof(short));
 
             float factor = g_pitch;
@@ -141,35 +67,46 @@ static int recordProcHook(HRECORD handle, const void* buffer, DWORD length, void
                 g_out[i] = clamp16(g_buf[src0] * (1.f - frac) + g_buf[src1] * frac);
             }
 
-            // Kirim g_out bukan buffer asli
+            // Debug: bandingkan sample pertama
+            static int log2 = 0;
+            if (!log2) {
+                log2 = 1;
+                char tmp[128];
+                snprintf(tmp, sizeof(tmp), "[VFX] in[0]=%d in[1]=%d out[0]=%d out[1]=%d n=%d pitch=%.2f",
+                    g_buf[0], g_buf[1], g_out[0], g_out[1], n, g_pitch);
+                logf(tmp);
+            }
+
             send_buf = (const void*)g_out;
         }
     }
 
-    // Teruskan ke callback asli SAMP dengan buffer hasil pitch
     if (g_origProc)
         return g_origProc(handle, send_buf, length, g_origUser);
     return 1;
 }
 
+static HDSP    (*pBASSChannelSetDSP)(HRECORD, DSPPROC, void*, int)    = nullptr;
+static int     (*pBASSChannelRemoveDSP)(HRECORD, HDSP)                = nullptr;
+static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*) = nullptr;
+static void*   (*pDobbySymbolResolver)(const char*, const char*)       = nullptr;
+static int     (*pDobbyHook)(void*, void*, void**)                     = nullptr;
+
+static HRECORD g_recHandle = 0;
+
 static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* proc, void* user) {
-    // Simpan proc asli, ganti dengan wrapper kita
     g_origProc = (RECORDPROC)proc;
     g_origUser = user;
 
-    // Panggil RecordStart dengan proc kita
     HRECORD handle = orig_BASSRecordStart(freq, chans, flags, (void*)recordProcHook, user);
     g_recHandle = handle;
 
     char tmp[128];
-    snprintf(tmp, sizeof(tmp), "[VFX] RecordStart hooked via proc! handle=%u freq=%u", handle, freq);
+    snprintf(tmp, sizeof(tmp), "[VFX] hooked! handle=%u freq=%u", handle, freq);
     logf(tmp);
     return handle;
 }
 
-// ============================================================
-// PUBLIC API
-// ============================================================
 static void  _vc_set_pitch(float f) {
     if (f < 0.25f) f = 0.25f;
     if (f > 4.0f)  f = 4.0f;
@@ -199,7 +136,7 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|2.1|VoiceFX crossfade|brruham";
+    static const char* info = "libvoicefx|2.0|VoiceFX|brruham";
     return (void*)info;
 }
 
