@@ -104,9 +104,15 @@ static HDSP    g_dspHandle = 0;
 static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* proc, void* user) {
     HRECORD handle = orig_BASSRecordStart(freq, chans, flags, proc, user);
     g_recHandle = handle;
-    if (pBASSChannelSetDSP)
+    if (pBASSChannelSetDSP) {
         g_dspHandle = pBASSChannelSetDSP(handle, dspCallback, nullptr, 1);
-    logf("[VFX] RecordStart hooked, DSP dipasang");
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp), "[VFX] RecordStart handle=%u freq=%u dspHandle=%u pDSP=%p",
+                 handle, freq, g_dspHandle, (void*)pBASSChannelSetDSP);
+        logf(tmp);
+    } else {
+        logf("[VFX] ERROR: pBASSChannelSetDSP null!");
+    }
     return handle;
 }
 
