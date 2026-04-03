@@ -78,13 +78,25 @@ static int recordProcHook(HRECORD handle, const void* buffer, DWORD length, void
             }
             g_wpos = (g_wpos + n) & RING_MASK;
 
-            // 2. Pastikan rpos tidak terlalu jauh tertinggal
-            // rpos harus dalam window [wpos - RING_SIZE/2, wpos]
-            float wposF = (float)g_wpos;
-            float diff  = wposF - g_rpos;
+            // 2. Frame counter — tunggu 2 frame sebelum mulai baca
+            static int frame_count = 0;
+            frame_count++;
+            if (frame_count < 3) {
+                // Belum cukup data, kirim silence
+                memset(g_out, 0, n * sizeof(short));
+                if (g_origProc) g_origProc(handle, g_out, length, g_origUser);
+                return 1;
+            }
+
+            // Inisialisasi rpos di frame ke-3 (ada 2 frame data di ring)
+            if (frame_count == 3) {
+                g_rpos = (float)((g_wpos - n * 2 + RING_SIZE) & RING_MASK);
+            }
+
+            // Jaga rpos tidak terlalu jauh tertinggal
+            float diff = (float)g_wpos - g_rpos;
             if (diff < 0) diff += RING_SIZE;
-            if (diff > RING_SIZE * 0.75f || diff < 0) {
-                // Reset rpos ke n frame sebelum wpos
+            if (diff > RING_SIZE * 0.75f) {
                 g_rpos = (float)((g_wpos - n * 2 + RING_SIZE) & RING_MASK);
             }
 
