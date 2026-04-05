@@ -1,7 +1,7 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
  * Algoritma: WSOLA (Waveform Similarity Overlap-Add)
- * v3.2 - fix FRAME/SEARCH threshold untuk buffer BASS Android (n=128)
+ * v3.3 - fix BUF_SIZE dan chunk processing untuk n=4800 (8000Hz SA-MP)
  */
 
 #include <stdint.h>
@@ -29,13 +29,14 @@ typedef void (*DSPPROC)(HDSP, DWORD, void*, DWORD, void*);
 
 // ============================================================
 // WSOLA PARAMETERS
-// Disesuaikan dengan buffer BASS Android (n=128 per callback)
-// Threshold = FRAME = 128, tercapai setelah 1 callback
+// BUF_SIZE harus > n_per_callback * beberapa frame
+// n SA-MP = 4800 (8000Hz mono), BUF_SIZE = 32768 aman
 // ============================================================
-#define FRAME       128
-#define HOP_A       32
-#define SEARCH      16
-#define BUF_SIZE    4096
+#define FRAME       512
+#define HOP_A       128
+#define SEARCH      32
+#define BUF_SIZE    32768
+#define CHUNK       512    // proses per 512 sample di dspCallback
 
 // ============================================================
 // GLOBAL STATE
@@ -79,7 +80,6 @@ static void resetState() {
 
 // ============================================================
 // CROSS-CORRELATION
-// pakai raw inBuf vs prevFrame (raw), bukan windowed
 // ============================================================
 static int findBestOffset(int readPos, int hopS) {
     if (firstFrame) return 0;
@@ -103,7 +103,7 @@ static int findBestOffset(int readPos, int hopS) {
 }
 
 // ============================================================
-// WSOLA PROCESS
+// WSOLA PROCESS - dipanggil per chunk
 // ============================================================
 static void wsolaProcess(short* s16, int n) {
     if (!g_enabled || g_pitch == 1.0f) return;
@@ -115,14 +115,11 @@ static void wsolaProcess(short* s16, int n) {
         inAvail++;
     }
 
-    // analysis hop: berubah sesuai pitch
     int hopS = (int)fmaxf(1.0f, (float)HOP_A / g_pitch);
 
-    // Threshold = FRAME saja, tanpa + SEARCH
     while (inAvail >= FRAME) {
         int offset = findBestOffset(inRead, hopS);
 
-        // Simpan raw ke prevFrame, lalu overlap-add dengan window
         for (int i = 0; i < FRAME; i++) {
             int idx = ((inRead + hopS + offset + i) % BUF_SIZE + BUF_SIZE) % BUF_SIZE;
             prevFrame[i] = (double)inBuf[idx];
@@ -137,11 +134,9 @@ static void wsolaProcess(short* s16, int n) {
 
         firstFrame = 0;
 
-        // synthesis hop TETAP HOP_A
         outWrite = (outWrite + HOP_A) % BUF_SIZE;
         outAvail += HOP_A;
 
-        // inRead maju HOP_A juga supaya inAvail berkurang konsisten
         inRead  = (inRead + HOP_A) % BUF_SIZE;
         inAvail -= HOP_A;
     }
@@ -160,23 +155,32 @@ static void wsolaProcess(short* s16, int n) {
 }
 
 // ============================================================
-// DSP CALLBACK
+// DSP CALLBACK - proses per chunk 512
 // ============================================================
 static int dbgCount = 0;
 
 static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
-    if (dbgCount++ % 200 == 0) {
+    short* s16 = (short*)buf;
+    int    n   = (int)(len / 2);
+
+    if (dbgCount++ % 50 == 0) {
         char tmp[128];
         snprintf(tmp, sizeof(tmp),
             "[VFX] DSP#%d enabled=%d pitch=%.2f n=%d inAvail=%d outAvail=%d",
-            dbgCount, g_enabled, g_pitch, (int)(len / 2), inAvail, outAvail);
+            dbgCount, g_enabled, g_pitch, n, inAvail, outAvail);
         logf(tmp);
     }
 
-    short* s16 = (short*)buf;
-    int    n   = (int)(len / 2);
-    if (n <= 0 || n > BUF_SIZE) return;
-    wsolaProcess(s16, n);
+    if (n <= 0) return;
+
+    // Proses per chunk supaya tidak overflow BUF_SIZE
+    int offset = 0;
+    while (offset < n) {
+        int chunk = n - offset;
+        if (chunk > CHUNK) chunk = CHUNK;
+        wsolaProcess(s16 + offset, chunk);
+        offset += chunk;
+    }
 }
 
 // ============================================================
@@ -264,7 +268,7 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|3.2|VoiceFX WSOLA|brruham";
+    static const char* info = "libvoicefx|3.3|VoiceFX WSOLA|brruham";
     return (void*)info;
 }
 
@@ -330,7 +334,7 @@ void OnModLoad() {
         logf("[VFX] ERROR: tidak bisa tulis voicefx_addr.txt");
     }
 
-    logf("[VFX] OnModLoad SELESAI - WSOLA v3.2 ready!");
+    logf("[VFX] OnModLoad SELESAI - WSOLA v3.3 ready!");
 }
 
 } // extern "C"
