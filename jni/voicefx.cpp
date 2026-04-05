@@ -1,22 +1,25 @@
 /**
- * voicefx.cpp - upgrade ke WSOLA
+ * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
+ * Algoritma: WSOLA (Waveform Similarity Overlap-Add)
+ * v3.1 - debug logging lengkap
  */
 
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#include <dlfcn.h>
 #include <android/log.h>
 #include <stdio.h>
-#include <dlfcn.h>
 
-#define LOG_TAG "libvoicefx"
+#define LOG_TAG  "libvoicefx"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGFILE "/storage/emulated/0/voicefx_log.txt"
+#define LOGFILE  "/storage/emulated/0/voicefx_log.txt"
 
 static void logf(const char* msg) {
     FILE* f = fopen(LOGFILE, "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
+    LOGI("%s", msg);
 }
 
 typedef unsigned int DWORD;
@@ -33,48 +36,60 @@ typedef void (*DSPPROC)(HDSP, DWORD, void*, DWORD, void*);
 #define BUF_SIZE    8192
 
 // ============================================================
-// STATE
+// GLOBAL STATE
 // ============================================================
-static float   g_pitch   = 1.0f;
-static int     g_enabled = 0;
+static float   g_pitch    = 1.0f;
+static int     g_enabled  = 0;
 
 static int16_t inBuf[BUF_SIZE];
 static int16_t outBuf[BUF_SIZE];
 static double  win[FRAME];
-static double  frame[FRAME];
-static double  prevFrame[FRAME];    // raw, bukan windowed
+static double  prevFrame[FRAME];
 
-static int inWrite   = 0;
-static int inRead    = 0;
-static int outWrite  = 0;
-static int outRead   = 0;
-static int inAvail   = 0;
-static int outAvail  = 0;
+static int inWrite    = 0;
+static int inRead     = 0;
+static int outWrite   = 0;
+static int outRead    = 0;
+static int inAvail    = 0;
+static int outAvail   = 0;
 static int firstFrame = 1;
 
 // ============================================================
-// PRE-COMPUTE HANN WINDOW
+// HANN WINDOW - pre-compute saat OnModLoad
 // ============================================================
 static void initWindow() {
     for (int i = 0; i < FRAME; i++)
         win[i] = 0.5 * (1.0 - cos(2.0 * M_PI * i / (FRAME - 1)));
+    logf("[VFX] Hann window initialized");
 }
 
 // ============================================================
-// CROSS-CORRELATION — cari offset terbaik
+// RESET STATE - dipanggil saat pitch berubah atau enable
+// ============================================================
+static void resetState() {
+    inWrite = inRead = outWrite = outRead = 0;
+    inAvail = outAvail = 0;
+    firstFrame = 1;
+    memset(inBuf,     0, sizeof(inBuf));
+    memset(outBuf,    0, sizeof(outBuf));
+    memset(prevFrame, 0, sizeof(prevFrame));
+}
+
+// ============================================================
+// CROSS-CORRELATION
+// pakai raw inBuf vs prevFrame (raw juga), bukan windowed
 // ============================================================
 static int findBestOffset(int readPos, int hopS) {
     if (firstFrame) return 0;
 
-    int   bestOffset = 0;
-    double bestCorr  = -1e18;
-    int   half       = SEARCH / 2;
+    int    bestOffset = 0;
+    double bestCorr   = -1e18;
+    int    half       = SEARCH / 2;
 
     for (int delta = -half; delta <= half; delta++) {
         double corr = 0.0;
         for (int i = 0; i < FRAME; i++) {
-            int idx = (readPos + hopS + delta + i + BUF_SIZE * 4) % BUF_SIZE;
-            // pakai raw inBuf, bukan windowed
+            int idx = ((readPos + hopS + delta + i) % BUF_SIZE + BUF_SIZE) % BUF_SIZE;
             corr += (double)inBuf[idx] * prevFrame[i];
         }
         if (corr > bestCorr) {
@@ -98,42 +113,46 @@ static void wsolaProcess(short* s16, int n) {
         inAvail++;
     }
 
-    int hopS = (int)fmaxf(1.0f, (float)HOP_A / g_pitch);  // analysis hop
+    // analysis hop: berubah sesuai pitch
+    // synthesis hop: HOP_A selalu tetap
+    int hopS = (int)fmaxf(1.0f, (float)HOP_A / g_pitch);
 
+    int loopCount = 0;
     while (inAvail >= FRAME + SEARCH) {
+        loopCount++;
+
         int offset = findBestOffset(inRead, hopS);
 
         // Simpan raw ke prevFrame SEBELUM windowing
+        // lalu langsung overlap-add dengan window
         for (int i = 0; i < FRAME; i++) {
-            int idx = (inRead + hopS + offset + i + BUF_SIZE * 4) % BUF_SIZE;
-            prevFrame[i] = (double)inBuf[idx];  // raw
-        }
+            int idx = ((inRead + hopS + offset + i) % BUF_SIZE + BUF_SIZE) % BUF_SIZE;
+            prevFrame[i] = (double)inBuf[idx];  // raw untuk korelasi berikutnya
 
-        // Apply window + overlap-add ke outBuf
-        for (int i = 0; i < FRAME; i++) {
             int    oIdx = (outWrite + i) % BUF_SIZE;
-            double v    = prevFrame[i] * win[i];
+            double v    = prevFrame[i] * win[i]; // windowed untuk output
             double sum  = (double)outBuf[oIdx] + v;
             if (sum >  32767.0) sum =  32767.0;
             if (sum < -32768.0) sum = -32768.0;
             outBuf[oIdx] = (int16_t)sum;
         }
 
-        // Advance — synthesis hop TETAP HOP_A
+        firstFrame = 0;
+
+        // synthesis hop TETAP HOP_A
         outWrite = (outWrite + HOP_A) % BUF_SIZE;
         outAvail += HOP_A;
 
-        // Advance input — analysis hop = hopS
+        // analysis hop = hopS
         inRead  = (inRead + HOP_A) % BUF_SIZE;
         inAvail -= HOP_A;
     }
-    firstFrame = 0;
 
-    // Baca output
+    // Baca output ke buffer
     for (int i = 0; i < n; i++) {
         if (outAvail > 0) {
-            s16[i]           = outBuf[outRead];
-            outBuf[outRead]  = 0;
+            s16[i]          = outBuf[outRead];
+            outBuf[outRead] = 0;
             outRead  = (outRead + 1) % BUF_SIZE;
             outAvail--;
         } else {
@@ -145,7 +164,18 @@ static void wsolaProcess(short* s16, int n) {
 // ============================================================
 // DSP CALLBACK
 // ============================================================
+static int dbgCount = 0;
+
 static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
+    // Debug log setiap 100 panggilan
+    if (dbgCount++ % 100 == 0) {
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp),
+            "[VFX] DSP#%d enabled=%d pitch=%.2f inAvail=%d outAvail=%d",
+            dbgCount, g_enabled, g_pitch, inAvail, outAvail);
+        logf(tmp);
+    }
+
     short* s16 = (short*)buf;
     int    n   = (int)(len / 2);
     if (n <= 0 || n > BUF_SIZE) return;
@@ -153,46 +183,71 @@ static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
 }
 
 // ============================================================
-// BASS + DOBBY (sama dengan sebelumnya)
+// BASS + DOBBY
 // ============================================================
-static HDSP    (*pBASSChannelSetDSP)(HRECORD, DSPPROC, void*, int)     = nullptr;
-static int     (*pBASSChannelRemoveDSP)(HRECORD, HDSP)                 = nullptr;
-static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*)  = nullptr;
-static void*   (*pDobbySymbolResolver)(const char*, const char*)        = nullptr;
-static int     (*pDobbyHook)(void*, void*, void**)                      = nullptr;
+static HDSP    (*pBASSChannelSetDSP)(HRECORD, DSPPROC, void*, int)    = nullptr;
+static int     (*pBASSChannelRemoveDSP)(HRECORD, HDSP)                = nullptr;
+static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*) = nullptr;
+static void*   (*pDobbySymbolResolver)(const char*, const char*)       = nullptr;
+static int     (*pDobbyHook)(void*, void*, void**)                     = nullptr;
 
 static HRECORD g_recHandle = 0;
 static HDSP    g_dspHandle = 0;
 
 static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* proc, void* user) {
+    logf("[VFX] hook_BASSRecordStart dipanggil");
     HRECORD handle = orig_BASSRecordStart(freq, chans, flags, proc, user);
     g_recHandle = handle;
-    if (pBASSChannelSetDSP)
+
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "[VFX] recHandle = %u", handle);
+    logf(tmp);
+
+    if (pBASSChannelSetDSP) {
         g_dspHandle = pBASSChannelSetDSP(handle, dspCallback, nullptr, 1);
-    logf("[VFX] RecordStart hooked, WSOLA DSP dipasang");
+        snprintf(tmp, sizeof(tmp), "[VFX] dspHandle = %u", g_dspHandle);
+        logf(tmp);
+    } else {
+        logf("[VFX] ERROR: pBASSChannelSetDSP null");
+    }
     return handle;
 }
 
 // ============================================================
-// VcAPI — sama, Lua tetap bisa kontrol
+// VcAPI FUNCTIONS
 // ============================================================
-static void  _vc_set_pitch(float f) {
+static void _vc_set_pitch(float f) {
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "[VFX] set_pitch called: %.2f", f);
+    logf(tmp);
+
     if (f < 0.25f) f = 0.25f;
     if (f > 4.0f)  f = 4.0f;
-    // Reset state saat pitch berubah
-    inWrite = inRead = outWrite = outRead = 0;
-    inAvail = outAvail = 0;
-    firstFrame = 1;
-    memset(inBuf,    0, sizeof(inBuf));
-    memset(outBuf,   0, sizeof(outBuf));
-    memset(prevFrame,0, sizeof(prevFrame));
+    resetState();
     g_pitch = f;
+
+    snprintf(tmp, sizeof(tmp), "[VFX] g_pitch now: %.2f", g_pitch);
+    logf(tmp);
 }
-static void  _vc_enable(void)     { g_enabled = 1; }
-static void  _vc_disable(void)    { g_enabled = 0; }
+
+static void _vc_enable(void) {
+    logf("[VFX] enable called");
+    resetState();
+    g_enabled = 1;
+}
+
+static void _vc_disable(void) {
+    logf("[VFX] disable called");
+    g_enabled = 0;
+    resetState();
+}
+
 static int   _vc_is_enabled(void) { return g_enabled; }
 static float _vc_get_pitch(void)  { return g_pitch; }
 
+// ============================================================
+// VcAPI STRUCT - diakses Lua via pointer
+// ============================================================
 struct VcAPI {
     void  (*set_pitch)(float);
     void  (*enable)(void);
@@ -212,7 +267,7 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|3.0|VoiceFX WSOLA|brruham";
+    static const char* info = "libvoicefx|3.1|VoiceFX WSOLA|brruham";
     return (void*)info;
 }
 
@@ -222,35 +277,62 @@ void OnModPreLoad() {
 }
 
 void OnModLoad() {
-    logf("[VFX] OnModLoad");
+    logf("[VFX] OnModLoad start");
 
-    initWindow();  // pre-compute Hann
+    initWindow();
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hDobby) { logf("[VFX] ERROR: libdobby"); return; }
+    if (!hDobby) { logf("[VFX] ERROR: libdobby.so tidak ditemukan"); return; }
+    logf("[VFX] libdobby.so loaded");
 
     pDobbySymbolResolver = (void*(*)(const char*,const char*))dlsym(hDobby, "DobbySymbolResolver");
     pDobbyHook           = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
-    if (!pDobbySymbolResolver || !pDobbyHook) { logf("[VFX] ERROR: Dobby sym"); return; }
+    if (!pDobbySymbolResolver || !pDobbyHook) {
+        logf("[VFX] ERROR: DobbySymbolResolver/DobbyHook tidak ditemukan");
+        return;
+    }
+    logf("[VFX] Dobby symbols OK");
 
     void* hBASS = dlopen("libBASS.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hBASS) { logf("[VFX] ERROR: libBASS"); return; }
+    if (!hBASS) { logf("[VFX] ERROR: libBASS.so tidak ditemukan"); return; }
+    logf("[VFX] libBASS.so loaded");
 
     pBASSChannelSetDSP    = (HDSP(*)(HRECORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
     pBASSChannelRemoveDSP = (int(*)(HRECORD,HDSP))dlsym(hBASS, "BASS_ChannelRemoveDSP");
 
+    if (!pBASSChannelSetDSP) {
+        logf("[VFX] ERROR: BASS_ChannelSetDSP tidak ditemukan");
+        return;
+    }
+    logf("[VFX] BASS DSP symbols OK");
+
     void* addr = pDobbySymbolResolver("libBASS.so", "BASS_RecordStart");
-    if (!addr) { logf("[VFX] ERROR: BASS_RecordStart"); return; }
+    if (!addr) { logf("[VFX] ERROR: BASS_RecordStart tidak ditemukan"); return; }
+
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "[VFX] BASS_RecordStart addr: %p", addr);
+    logf(tmp);
 
     if (pDobbyHook(addr, (void*)hook_BASSRecordStart, (void**)&orig_BASSRecordStart) != 0) {
-        logf("[VFX] ERROR: DobbyHook"); return;
+        logf("[VFX] ERROR: DobbyHook gagal");
+        return;
     }
+    logf("[VFX] Hook BASS_RecordStart OK");
 
     g_pitch   = 1.0f;
     g_enabled = 0;
+    resetState();
 
+    // Tulis alamat vc_api ke file untuk dibaca Lua
     FILE* af = fopen("/storage/emulated/0/voicefx_addr.txt", "w");
-    if (af) { fprintf(af, "%lu\n", (unsigned long)&vc_api); fclose(af); }
+    if (af) {
+        fprintf(af, "%lu\n", (unsigned long)&vc_api);
+        fclose(af);
+        snprintf(tmp, sizeof(tmp), "[VFX] vc_api addr ditulis: %lu", (unsigned long)&vc_api);
+        logf(tmp);
+    } else {
+        logf("[VFX] ERROR: tidak bisa tulis voicefx_addr.txt");
+    }
 
     logf("[VFX] OnModLoad SELESAI - WSOLA ready!");
 }
