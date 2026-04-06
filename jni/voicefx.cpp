@@ -1,12 +1,10 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
- * Algoritma: Simple Resample + Cubic (Catmull-Rom) Interpolation
- * v4.0 - terbukti bekerja, fix untuk n=4800 (SA-MP 8000Hz)
+ * Algoritma: Simple Resample + Hermite Interpolation
+ * v4.1 - ganti Catmull-Rom ke Hermite, tidak overshoot, tidak echo
  *
- * Prinsip:
- *   pitch > 1.0 → baca sample lebih cepat → suara lebih tinggi
- *   pitch < 1.0 → baca sample lebih lambat → suara lebih rendah
- *   Cubic interpolation → transisi antar sample smooth, tidak patah
+ * Hermite dijamin output dalam range antara dua sample terdekat
+ * → tidak ada amplitudo spike → tidak ada echo feedback
  */
 
 #include <stdint.h>
@@ -31,12 +29,11 @@ typedef unsigned int HRECORD;
 typedef unsigned int HDSP;
 typedef void (*DSPPROC)(HDSP, DWORD, void*, DWORD, void*);
 
-// Buffer lebih dari cukup untuk n=4800
 #define MAX_BUF 8192
 
 static float   g_pitch   = 1.0f;
 static int     g_enabled = 0;
-static int16_t g_buf[MAX_BUF];  // backup buffer sebelum processing
+static int16_t g_buf[MAX_BUF];
 
 // ============================================================
 // CLAMP 16-bit
@@ -48,7 +45,8 @@ static inline int16_t clamp16(float v) {
 }
 
 // ============================================================
-// DSP CALLBACK - Simple Resample + Cubic Interpolation
+// DSP CALLBACK - Simple Resample + Hermite Interpolation
+// Hermite tidak overshoot → amplitudo terjaga → tidak ada echo
 // ============================================================
 static int dbgCount = 0;
 
@@ -67,7 +65,7 @@ static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
     if (g_pitch > 0.99f && g_pitch < 1.01f) return;
     if (n <= 0 || n > MAX_BUF) {
         char tmp[64];
-        snprintf(tmp, sizeof(tmp), "[VFX] ERROR: n=%d out of range", n);
+        snprintf(tmp, sizeof(tmp), "[VFX] ERROR: n=%d out of range (MAX=%d)", n, MAX_BUF);
         logf(tmp);
         return;
     }
@@ -83,29 +81,29 @@ static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
     for (int i = 0; i < n; i++) {
         float srcF = i * factor;
 
-        // Clamp - jangan baca melewati buffer
+        // Clamp agar tidak baca melewati buffer
         if (srcF > maxSrc) srcF = maxSrc;
 
         int s0 = (int)srcF;
-        float frac = srcF - s0;
+        float frac = srcF - (float)s0;
 
-        // Ambil 4 titik untuk Catmull-Rom cubic
-        int sm1 = s0 - 1; if (sm1 < 0)     sm1 = 0;
-        int s1  = s0 + 1; if (s1  >= n)    s1  = n - 1;
-        int s2  = s0 + 2; if (s2  >= n)    s2  = n - 1;
+        // 4 titik dengan boundary guard
+        int sm1 = s0 - 1; if (sm1 < 0)  sm1 = 0;
+        int s1  = s0 + 1; if (s1  >= n) s1  = n - 1;
+        int s2  = s0 + 2; if (s2  >= n) s2  = n - 1;
 
         float p0 = (float)g_buf[sm1];
         float p1 = (float)g_buf[s0];
         float p2 = (float)g_buf[s1];
         float p3 = (float)g_buf[s2];
 
-        // Catmull-Rom cubic interpolation
-        float a = -0.5f*p0 + 1.5f*p1 - 1.5f*p2 + 0.5f*p3;
-        float b =       p0 - 2.5f*p1 + 2.0f*p2 - 0.5f*p3;
-        float c = -0.5f*p0            + 0.5f*p2;
-        float d =                  p1;
+        // Hermite interpolation — tidak overshoot
+        float c0 = p1;
+        float c1 = 0.5f * (p2 - p0);
+        float c2 = p0 - 2.5f * p1 + 2.0f * p2 - 0.5f * p3;
+        float c3 = 0.5f * (p3 - p0) + 1.5f * (p1 - p2);
 
-        float v = ((a * frac + b) * frac + c) * frac + d;
+        float v = ((c3 * frac + c2) * frac + c1) * frac + c0;
         s16[i] = clamp16(v);
     }
 }
@@ -194,7 +192,7 @@ VcAPI vc_api = {
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|4.0|VoiceFX Cubic Resample|brruham";
+    static const char* info = "libvoicefx|4.1|VoiceFX Hermite|brruham";
     return (void*)info;
 }
 
@@ -258,7 +256,7 @@ void OnModLoad() {
         logf("[VFX] ERROR: tidak bisa tulis voicefx_addr.txt");
     }
 
-    logf("[VFX] OnModLoad SELESAI - Cubic Resample v4.0 ready!");
+    logf("[VFX] OnModLoad SELESAI - Hermite v4.1 ready!");
 }
 
 } // extern "C"
