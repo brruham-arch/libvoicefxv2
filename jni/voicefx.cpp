@@ -1,10 +1,7 @@
 /**
  * voicefx.cpp - AML Voice FX Mod untuk SA-MP Android
  * Algoritma: Simple Resample + Hermite Interpolation
- * v4.1 - ganti Catmull-Rom ke Hermite, tidak overshoot, tidak echo
- *
- * Hermite dijamin output dalam range antara dua sample terdekat
- * → tidak ada amplitudo spike → tidak ada echo feedback
+ * v4.2 - tambah get_rec_handle di VcAPI untuk recorder.lua
  */
 
 #include <stdint.h>
@@ -45,8 +42,7 @@ static inline int16_t clamp16(float v) {
 }
 
 // ============================================================
-// DSP CALLBACK - Simple Resample + Hermite Interpolation
-// Hermite tidak overshoot → amplitudo terjaga → tidak ada echo
+// DSP CALLBACK - Hermite Interpolation
 // ============================================================
 static int dbgCount = 0;
 
@@ -80,14 +76,11 @@ static void dspCallback(HDSP, DWORD, void* buf, DWORD len, void*) {
 
     for (int i = 0; i < n; i++) {
         float srcF = i * factor;
-
-        // Clamp agar tidak baca melewati buffer
         if (srcF > maxSrc) srcF = maxSrc;
 
-        int s0 = (int)srcF;
+        int   s0   = (int)srcF;
         float frac = srcF - (float)s0;
 
-        // 4 titik dengan boundary guard
         int sm1 = s0 - 1; if (sm1 < 0)  sm1 = 0;
         int s1  = s0 + 1; if (s1  >= n) s1  = n - 1;
         int s2  = s0 + 2; if (s2  >= n) s2  = n - 1;
@@ -138,6 +131,15 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
         logf("[VFX] ERROR: pBASSChannelSetDSP null");
     }
 
+    // Tulis recHandle ke file supaya recorder.lua bisa baca
+    FILE* rf = fopen("/storage/emulated/0/voicefx_rechandle.txt", "w");
+    if (rf) {
+        fprintf(rf, "%u\n", handle);
+        fclose(rf);
+        snprintf(tmp, sizeof(tmp), "[VFX] recHandle ditulis ke file: %u", handle);
+        logf(tmp);
+    }
+
     return handle;
 }
 
@@ -148,11 +150,9 @@ static void _vc_set_pitch(float f) {
     char tmp[64];
     snprintf(tmp, sizeof(tmp), "[VFX] set_pitch called: %.2f", f);
     logf(tmp);
-
     if (f < 0.25f) f = 0.25f;
     if (f > 4.0f)  f = 4.0f;
     g_pitch = f;
-
     snprintf(tmp, sizeof(tmp), "[VFX] g_pitch now: %.2f", g_pitch);
     logf(tmp);
 }
@@ -167,18 +167,20 @@ static void _vc_disable(void) {
     g_enabled = 0;
 }
 
-static int   _vc_is_enabled(void) { return g_enabled; }
-static float _vc_get_pitch(void)  { return g_pitch; }
+static int          _vc_is_enabled(void)    { return g_enabled; }
+static float        _vc_get_pitch(void)     { return g_pitch; }
+static unsigned int _vc_get_rec_handle(void){ return g_recHandle; }
 
 // ============================================================
 // VcAPI STRUCT
 // ============================================================
 struct VcAPI {
-    void  (*set_pitch)(float);
-    void  (*enable)(void);
-    void  (*disable)(void);
-    int   (*is_enabled)(void);
-    float (*get_pitch)(void);
+    void         (*set_pitch)(float);
+    void         (*enable)(void);
+    void         (*disable)(void);
+    int          (*is_enabled)(void);
+    float        (*get_pitch)(void);
+    unsigned int (*get_rec_handle)(void);
 };
 
 extern "C" {
@@ -189,15 +191,17 @@ VcAPI vc_api = {
     _vc_disable,
     _vc_is_enabled,
     _vc_get_pitch,
+    _vc_get_rec_handle,
 };
 
 void* __GetModInfo() {
-    static const char* info = "libvoicefx|4.1|VoiceFX Hermite|brruham";
+    static const char* info = "libvoicefx|4.2|VoiceFX Hermite|brruham";
     return (void*)info;
 }
 
 void OnModPreLoad() {
     remove(LOGFILE);
+    remove("/storage/emulated/0/voicefx_rechandle.txt");
     logf("[VFX] OnModPreLoad");
 }
 
@@ -256,7 +260,7 @@ void OnModLoad() {
         logf("[VFX] ERROR: tidak bisa tulis voicefx_addr.txt");
     }
 
-    logf("[VFX] OnModLoad SELESAI - Hermite v4.1 ready!");
+    logf("[VFX] OnModLoad SELESAI - Hermite v4.2 ready!");
 }
 
 } // extern "C"
